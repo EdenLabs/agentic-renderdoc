@@ -21,11 +21,12 @@ class RenderDocClient:
     """
 
     def __init__(self):
-        self._sock       : socket.socket | None = None
-        self._port       : int | None           = None
-        self._buffer     : str                  = ""
-        self._instances  : list[dict] | None    = None
-        self._conn_info  : dict | None          = None
+        self._sock          : socket.socket | None = None
+        self._port          : int | None           = None
+        self._buffer        : str                  = ""
+        self._disconnected  : bool                 = False
+        self._instances     : list[dict] | None    = None
+        self._conn_info     : dict | None          = None
 
     # --- Properties ---
 
@@ -45,7 +46,8 @@ class RenderDocClient:
         """Connect to a RenderDoc instance on the given port.
 
         Closes any existing connection first, then opens a new TCP socket
-        to 127.0.0.1 on the specified port.
+        to 127.0.0.1 on the specified port. Clears the disconnected flag
+        so that auto-reconnect in ensure_connected() works again.
         """
         self.disconnect()
 
@@ -54,23 +56,27 @@ class RenderDocClient:
         sock.connect(("127.0.0.1", port))
         sock.settimeout(None)
 
-        self._sock = sock
-        self._port = port
+        self._sock          = sock
+        self._port          = port
+        self._disconnected  = False
 
     def disconnect(self):
         """Close the current connection, if any.
 
-        Resets internal socket, port, and read buffer state. Does not
-        clear cached discovery or connection info.
+        Resets internal socket, port, and read buffer state. Sets the
+        disconnected flag to prevent ensure_connected() from silently
+        auto-reconnecting. Does not clear cached discovery or connection
+        info. Call connect() to reconnect.
         """
         if self._sock is not None:
             try:
                 self._sock.close()
             except OSError:
                 pass
-            self._sock   = None
-            self._port   = None
-            self._buffer = ""
+            self._sock          = None
+            self._port          = None
+            self._buffer        = ""
+            self._disconnected  = True
 
     def discover_instances(self, enrich: bool = False) -> list[dict]:
         """Probe the port range for running RenderDoc instances.
@@ -99,11 +105,20 @@ class RenderDocClient:
         first one, queries its instance_info, and caches the results.
         Subsequent calls while connected return the cached info.
 
+        Raises ConnectionError if a prior disconnect() has not been
+        followed by an explicit connect(). This prevents send() from
+        silently reconnecting after the user explicitly disconnected.
+
         Returns a dict with:
             port      -- The port connected to.
             info      -- instance_info data from the connected instance.
             others    -- List of other available instances (port dicts).
         """
+        if self._disconnected:
+            raise ConnectionError(
+                "disconnected; use instance(action='connect') to reconnect"
+            )
+
         if self._sock is not None:
             return {
                 "port"   : self._port,

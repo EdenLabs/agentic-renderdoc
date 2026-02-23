@@ -263,6 +263,14 @@ def pipeline_state(state: rd.PipeState) -> dict:
         if int(shader) != 0:
             result["shaders"][name] = resource_id(shader)
 
+    # The compute shader ID persists across events. When any graphics
+    # shaders are bound, the CS is stale noise from the last dispatch.
+    has_graphics = any(
+        k in result["shaders"] for k in ("vs", "hs", "ds", "gs", "ps")
+    )
+    if has_graphics and "cs" in result["shaders"]:
+        del result["shaders"]["cs"]
+
     # Output targets.
     try:
         om = state.GetOutputTargets()
@@ -603,24 +611,43 @@ def cbuffer_variables(variables, data: bytes) -> list:
             v["rows"]    = rows
             v["columns"] = cols
 
-            # Try to extract the value from the raw buffer data.
-            offset     = var.byteOffset
-            elem_count = rows * cols
-            byte_size  = elem_count * 4
+            # Array info from reflection.
+            elements     = getattr(vtype, "elements", 0)
+            array_stride = getattr(vtype, "arrayByteStride", 0)
 
-            if offset + byte_size <= len(data) and elem_count > 0:
-                # Select unpack format based on the type name.
-                type_lower = type_name.lower()
-                if type_lower in ("uint", "uint32", "dword"):
-                    fmt = "I"  # unsigned 32-bit int
-                elif type_lower in ("int", "int32"):
-                    fmt = "i"  # signed 32-bit int
-                elif type_lower in ("bool",):
-                    fmt = "I"  # bool stored as uint
-                else:
-                    fmt = "f"  # float (default)
+            # Select unpack format based on the type name.
+            type_lower = type_name.lower()
+            if type_lower in ("uint", "uint32", "dword"):
+                fmt = "I"  # unsigned 32-bit int
+            elif type_lower in ("int", "int32"):
+                fmt = "i"  # signed 32-bit int
+            elif type_lower in ("bool",):
+                fmt = "I"  # bool stored as uint
+            else:
+                fmt = "f"  # float (default)
 
-                values     = struct.unpack_from(f"<{elem_count}{fmt}", data, offset)
+            # Per-element component count (e.g., 3 for a float3).
+            comp_count = rows * cols
+            comp_bytes = comp_count * 4
+
+            offset = var.byteOffset
+
+            if elements > 0 and array_stride > 0:
+                # Array variable: read each element at stride intervals.
+                v["elements"]     = elements
+                v["array_stride"] = array_stride
+                all_values        = []
+                for i in range(elements):
+                    elem_offset = offset + i * array_stride
+                    if elem_offset + comp_bytes <= len(data):
+                        vals = struct.unpack_from(f"<{comp_count}{fmt}", data, elem_offset)
+                        all_values.append(list(vals))
+                    else:
+                        break
+                v["value"] = all_values
+            elif comp_count > 0 and offset + comp_bytes <= len(data):
+                # Scalar or vector/matrix variable.
+                values     = struct.unpack_from(f"<{comp_count}{fmt}", data, offset)
                 v["value"] = list(values)
         except Exception:
             pass

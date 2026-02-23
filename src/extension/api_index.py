@@ -8,6 +8,105 @@ import inspect
 import re
 
 
+# --- Synonyms ---
+
+# Maps common search terms to related API names. When a user searches for a
+# term on the left, entries matching any term on the right are also considered.
+# Synonym matches are penalized slightly (-5) so direct matches rank first.
+#
+# Coverage targets: D3D/Vulkan/GL terminology, natural language terms LLMs
+# commonly use, and common abbreviations.
+_SYNONYMS = {
+    # Constant buffers / uniforms.
+    "constant buffer": ["constantblock", "getconstantblocks", "cbuffer"],
+    "cbuffer":         ["constantblock", "getconstantblocks", "constant buffer"],
+    "uniform":         ["constantblock", "getconstantblocks", "cbuffer"],
+
+    # Textures.
+    "texture":         ["gettextures", "texturedescription", "gettexturedata"],
+
+    # Buffers (general).
+    "buffer":          ["getbuffers", "bufferdescription", "getbufferdata"],
+
+    # Render targets / color attachments / framebuffers.
+    "render target":   ["getoutputtargets", "outputtarget", "colorblend"],
+    "color attachment": ["getoutputtargets", "outputtarget", "colorblend"],
+    "framebuffer":     ["getoutputtargets", "outputtarget", "colorblend"],
+
+    # Depth / stencil.
+    "depth":           ["getdepthtarget", "depthstencil"],
+    "stencil":         ["depthstencil", "getdepthtarget", "stencilstate"],
+    "depth test":      ["depthstencil", "getdepthtarget", "depthstate"],
+
+    # Vertex / index buffers.
+    "vertex buffer":   ["getvbuffers", "vbuffer"],
+    "index buffer":    ["getibuffer", "ibuffer"],
+
+    # Blend state.
+    "blend":           ["getcolorblends", "colorblend"],
+
+    # Viewport / scissor.
+    "viewport":        ["getviewport"],
+    "scissor":         ["getscissor"],
+
+    # Shaders.
+    "shader":          ["getshader", "getshaderreflection", "shaderreflection"],
+
+    # Draw calls / dispatches.
+    "draw":            ["drawcall", "actiondescription", "getrootactions"],
+    "dispatch":        ["dispatch", "computeshader"],
+
+    # Push constants.
+    "push constant":   ["pushconsts", "pushconstant"],
+
+    # Descriptors / resources.
+    "descriptor":      ["descriptoraccess", "useddescriptor", "descriptorstore"],
+    "resource":        ["getresources", "resourcedescription", "resourceid"],
+
+    # Disassembly / debug.
+    "disassembly":     ["disassembleshader", "getdisassemblytargets"],
+    "debug":           ["debugpixel", "debugvertex", "shaderdebug"],
+
+    # UAV / storage buffers / RWBuffers.
+    "uav":             ["readwriteresource", "rwbuffer", "rwtexture", "unorderedaccess"],
+    "storage buffer":  ["readwriteresource", "rwbuffer", "unorderedaccess"],
+    "read write":      ["readwriteresource", "rwbuffer", "rwtexture", "unorderedaccess"],
+
+    # SRV / shader resources / read-only.
+    "srv":             ["shaderresource", "readonlyresource", "srvresource"],
+    "shader resource": ["readonlyresource", "srvresource", "gettextures", "getbuffers"],
+    "read only":       ["readonlyresource", "srvresource", "shaderresource"],
+
+    # Samplers / filtering.
+    "sampler":         ["getsampler", "getsamplers", "samplerstate", "filtering"],
+    "filtering":       ["getsampler", "getsamplers", "samplerstate"],
+
+    # Rasterizer state.
+    "rasterizer":      ["rasterstate", "getrasterization", "fillmode", "cullmode"],
+    "fill mode":       ["rasterstate", "getrasterization", "fillmode"],
+    "cull mode":       ["rasterstate", "getrasterization", "cullmode"],
+
+    # Topology / primitives.
+    "topology":        ["primitive", "primitivetopology", "topology"],
+    "primitive":       ["topology", "primitivetopology"],
+
+    # Input layout / vertex attributes.
+    "input layout":    ["vertexinput", "inputlayout", "vertexattribute", "getvbuffers"],
+    "vertex input":    ["inputlayout", "vertexattribute", "getvbuffers"],
+    "vertex attribute": ["inputlayout", "vertexinput", "getvbuffers"],
+
+    # Copy / blit / transfer operations.
+    "copy":            ["copyresource", "blit", "transfer", "copytexture", "copybuffer"],
+    "blit":            ["copyresource", "copy", "transfer", "resolvetexture"],
+    "transfer":        ["copyresource", "copy", "blit"],
+
+    # Debug markers / annotations.
+    "marker":          ["debugmarker", "debuggroup", "annotation", "pushmarker", "setmarker"],
+    "debug group":     ["debugmarker", "annotation", "pushmarker", "popmarker"],
+    "annotation":      ["debugmarker", "debuggroup", "pushmarker", "setmarker"],
+}
+
+
 # --- Public API ---
 
 def build_index():
@@ -33,11 +132,17 @@ def search_index(index, query):
     """Search the index for entries matching the query string.
 
     Matches against name and docstring content. Case-insensitive.
-    Results are ranked by relevance:
-    - Exact unqualified name match scores highest.
-    - Unqualified name prefix match next.
-    - Substring match on qualified name next.
-    - Doc-body-only matches score lowest.
+    Supports natural language queries ("pipeline state"), CamelCase
+    identifiers ("GetPipelineState"), and fuzzy/truncated queries.
+
+    Results are ranked by relevance (highest first):
+    - Exact unqualified name match (100)
+    - Unqualified name prefix match (80)
+    - Qualified name substring match (60)
+    - Token-based name match (50) / prefix token match (45)
+    - Fuzzy edit-distance match (40/30/25)
+    - Doc body substring match (20) / doc body token match (15)
+    - Synonym expansions apply a -5 penalty to the above tiers
     """
     query_lower = query.lower()
     scored      = []
@@ -52,6 +157,90 @@ def search_index(index, query):
     return [entry for _, entry in scored]
 
 
+# --- Tokenization ---
+
+# Splits on CamelCase boundaries, underscores, and digit transitions.
+# "GetPipelineState" -> ["Get", "Pipeline", "State"]
+# "RESOURCE"         -> ["RESOURCE"]
+# "getVBuffers"      -> ["get", "V", "Buffers"]
+_CAMEL_SPLIT_RE = re.compile(
+    r"[A-Z]+(?=[A-Z][a-z])"   # Uppercase run before a CamelCase word.
+    r"|[A-Z][a-z]+"           # CamelCase word starting with uppercase.
+    r"|[A-Z]+"                # Remaining uppercase run (e.g. "RESOURCE", "SRV").
+    r"|[a-z]+"                # Lowercase word.
+    r"|[0-9]+"                # Digit run.
+)
+
+
+def _tokenize_name(name):
+    """Split an API name into lowercase tokens by CamelCase and underscores.
+
+    Handles PascalCase, camelCase, SCREAMING_SNAKE, and mixed identifiers.
+
+    Examples:
+        "GetPipelineState" -> ["get", "pipeline", "state"]
+        "ShaderStage"      -> ["shader", "stage"]
+        "RESOURCE"         -> ["resource"]
+        "getVBuffers"      -> ["get", "v", "buffers"]
+    """
+    # Split on underscores first, then split each segment by CamelCase.
+    tokens = []
+    for segment in name.split("_"):
+        tokens.extend(m.group().lower() for m in _CAMEL_SPLIT_RE.finditer(segment))
+    return tokens
+
+
+def _tokenize_query(query):
+    """Split a search query into lowercase tokens.
+
+    Handles both natural language ("pipeline state") and identifier-style
+    ("GetPipelineState") queries. Splits on whitespace first, then applies
+    CamelCase splitting to each word.
+    """
+    tokens = []
+    for word in query.split():
+        camel_tokens = _tokenize_name(word)
+        if camel_tokens:
+            tokens.extend(camel_tokens)
+        else:
+            # Fallback: the word had no alphanumeric content. Keep it as-is.
+            tokens.append(word.lower())
+    return tokens
+
+
+# --- Edit Distance ---
+
+def _edit_distance(a, b):
+    """Compute the Levenshtein edit distance between two strings.
+
+    Standard dynamic programming implementation. O(len(a) * len(b)) time
+    and O(min(len(a), len(b))) space (single-row optimization).
+    """
+    # Ensure a is the shorter string for space efficiency.
+    if len(a) > len(b):
+        a, b = b, a
+
+    m = len(a)
+    n = len(b)
+
+    # Previous row of distances.
+    prev = list(range(m + 1))
+    curr = [0] * (m + 1)
+
+    for j in range(1, n + 1):
+        curr[0] = j
+        for i in range(1, m + 1):
+            cost    = 0 if a[i - 1] == b[j - 1] else 1
+            curr[i] = min(
+                curr[i - 1] + 1,       # Insertion.
+                prev[i] + 1,           # Deletion.
+                prev[i - 1] + cost,    # Substitution.
+            )
+        prev, curr = curr, prev
+
+    return prev[m]
+
+
 # --- Scoring ---
 
 def _score_entry(entry, query_lower):
@@ -59,23 +248,157 @@ def _score_entry(entry, query_lower):
 
     Returns an integer score. Zero means no match.
 
+    Computes the base score for the original query, then checks synonym
+    expansions. Synonym matches are penalized by -5 so direct matches
+    are preferred. If no direct or synonym match is found, attempts
+    fuzzy matching as a last resort.
+    """
+    best = _score_query(entry, query_lower)
+
+    # Check synonyms.
+    for syn in _SYNONYMS.get(query_lower, []):
+        syn_score = _score_query(entry, syn.lower())
+        if syn_score > 0:
+            best = max(best, syn_score - 5)
+
+    # Fuzzy matching: only try when nothing else matched, and the query is
+    # long enough that edit distance is meaningful (> 4 chars).
+    if best == 0 and len(query_lower) > 4:
+        best = max(best, _score_fuzzy(entry, query_lower))
+
+    return best
+
+
+def _score_query(entry, query_lower):
+    """Score a single index entry against a single lowercased search term.
+
+    Returns an integer score. Zero means no match.
+
     Scoring tiers:
     - 100: exact match on unqualified name
     -  80: unqualified name starts with query
-    -  60: qualified name contains query
-    -  20: doc body contains query
+    -  60: qualified name contains query as substring
+    -  50: all query tokens appear in the name tokens (token match)
+    -  45: all query tokens appear in the name tokens as prefixes
+    -  20: doc body contains query as substring
+    -  15: all query tokens appear in the doc body
     """
     name_lower  = entry["name"].lower()
     unqualified = name_lower.rsplit(".", 1)[-1]
 
+    # Tier 1: exact name match.
     if unqualified == query_lower:
         return 100
+
+    # Tier 2: name prefix match.
     if unqualified.startswith(query_lower):
         return 80
+
+    # Tier 3: qualified name substring match.
     if query_lower in name_lower:
         return 60
+
+    # Tier 4: token-based matching on the name.
+    # Tokenize from the original-cased name so CamelCase boundaries are preserved.
+    query_tokens         = _tokenize_query(query_lower)
+    unqualified_original = entry["name"].rsplit(".", 1)[-1]
+    if len(query_tokens) > 1 or (len(query_tokens) == 1 and " " not in query_lower):
+        name_tokens = _tokenize_name(unqualified_original)
+        token_score = _score_tokens(query_tokens, name_tokens)
+        if token_score > 0:
+            return token_score
+
+    # Tier 5: doc body substring match.
     if entry["doc"] and query_lower in entry["doc"].lower():
         return 20
+
+    # Tier 6: doc body token match.
+    if entry["doc"] and len(query_tokens) > 1:
+        doc_lower = entry["doc"].lower()
+        if all(qt in doc_lower for qt in query_tokens):
+            return 15
+
+    return 0
+
+
+def _score_tokens(query_tokens, name_tokens):
+    """Score query tokens against name tokens.
+
+    Returns 50 if all query tokens exactly match a name token, 45 if all
+    query tokens are prefixes of some name token, or 0 if any query token
+    has no match.
+
+    Each query token is matched independently. A name token can only be
+    claimed by one query token (greedy, but order-independent).
+    """
+    if not query_tokens or not name_tokens:
+        return 0
+
+    # Try exact token matches first.
+    available = list(name_tokens)
+    all_exact = True
+    for qt in query_tokens:
+        found = False
+        for i, nt in enumerate(available):
+            if nt == qt:
+                available.pop(i)
+                found = True
+                break
+        if not found:
+            all_exact = False
+            break
+
+    if all_exact:
+        return 50
+
+    # Try prefix token matches.
+    available  = list(name_tokens)
+    all_prefix = True
+    for qt in query_tokens:
+        found = False
+        for i, nt in enumerate(available):
+            if nt.startswith(qt) or qt.startswith(nt):
+                available.pop(i)
+                found = True
+                break
+        if not found:
+            all_prefix = False
+            break
+
+    if all_prefix:
+        return 45
+
+    return 0
+
+
+def _score_fuzzy(entry, query_lower):
+    """Score an entry using edit distance as a last resort.
+
+    Only called when no other scoring method produced a match. Compares
+    the query against the unqualified name. For queries longer than 4
+    characters:
+    - Edit distance 1 scores 40.
+    - Edit distance 2 scores 25.
+    - Greater distances score 0.
+    """
+    unqualified = entry["name"].rsplit(".", 1)[-1].lower()
+
+    # Compare against full unqualified name.
+    dist = _edit_distance(query_lower, unqualified)
+    if dist <= 1:
+        return 40
+    if dist <= 2:
+        return 25
+
+    # Also try matching query as a prefix of the name (for truncated queries
+    # like "GetPipelineStat" matching "GetPipelineState").
+    if len(query_lower) >= 5 and len(unqualified) > len(query_lower):
+        prefix_dist = _edit_distance(query_lower, unqualified[:len(query_lower)])
+        if prefix_dist == 0:
+            # Exact prefix of the name, just truncated.
+            return 40
+        if prefix_dist <= 1:
+            return 30
 
     return 0
 

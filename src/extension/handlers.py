@@ -60,6 +60,8 @@ def handle_eval(ctx, params):
         response = {"ok": True, "data": result}
         if captured_output:
             response["output"] = captured_output
+        if ctx._replay_warnings:
+            response["warnings"] = list(ctx._replay_warnings)
         return response
     except Exception as e:
         response = {
@@ -68,6 +70,8 @@ def handle_eval(ctx, params):
         }
         if captured_output:
             response["output"] = captured_output
+        if ctx._replay_warnings:
+            response["warnings"] = list(ctx._replay_warnings)
         return response
 
 
@@ -144,14 +148,65 @@ def handle_instance_info(ctx, params):
     }
 
 
+# --- reload (dev only) ---
+
+@handler(
+    "reload",
+    description="Hot-reload extension modules without restarting RenderDoc.",
+    schema={},
+)
+def handle_reload(ctx, params):
+    """Reload business-logic modules in dependency order.
+
+    Leaves winsock and bridge untouched (infrastructure). Mutates the
+    HANDLERS dict in-place so the bridge's reference stays valid.
+    Rebuilds the API index and clears the serializer cache.
+    """
+    import importlib
+    from . import serialize, api_index, utilities
+
+    # Reload in dependency order: leaves first, then this module.
+    importlib.reload(serialize)
+    importlib.reload(api_index)
+    importlib.reload(utilities)
+
+    # Save reference to the dict the bridge is holding.
+    old_handlers = HANDLERS
+
+    # Reload this module. This re-runs all @handler decorators into a
+    # fresh HANDLERS dict inside the new module object.
+    from . import handlers as _self
+    importlib.reload(_self)
+
+    # Splice the new registrations into the old dict object.
+    old_handlers.clear()
+    old_handlers.update(_self.HANDLERS)
+
+    # Rebuild the API index with the reloaded api_index module.
+    from .api_index import build_index
+    ctx._api_index = build_index()
+
+    # Clear the serializer cache so it picks up the reloaded serialize module.
+    global _SERIALIZER_MAP
+    _SERIALIZER_MAP = None
+
+    return {
+        "ok"   : True,
+        "data" : {
+            "reloaded"  : ["serialize", "api_index", "utilities", "handlers"],
+            "handlers"  : list(old_handlers.keys()),
+        },
+    }
+
+
 # --- Internal helpers ---
 
 def _build_namespace(ctx, captured_output):
     """Build the execution namespace for eval, including utilities.
 
-    Injects RenderDoc modules (rd, qrd, pyrenderdoc), the handler context,
-    the serialize module, and a print override that captures output to
-    captured_output so it can be included in the response.
+    Injects RenderDoc modules (rd, qrd), the handler context, the serialize
+    module, and a print override that captures output to captured_output so
+    it can be included in the response.
 
     ctx             -- HandlerContext shared with all handlers.
     captured_output -- Mutable list; print calls append strings here.
@@ -171,12 +226,6 @@ def _build_namespace(ctx, captured_output):
         ns["qrd"] = qrd
     except ImportError:
         pass
-
-    # The pyrenderdoc global is injected by RenderDoc into the extension
-    # environment. It may not exist during testing.
-    import builtins
-    if hasattr(builtins, "pyrenderdoc"):
-        ns["pyrenderdoc"] = builtins.pyrenderdoc
 
     # Expose the serialize module so agents can call serializers directly.
     try:
@@ -248,9 +297,8 @@ def _format_error(exc, code, namespace):
     formatted = "".join(tb_lines)
     msg       = str(exc)
 
-    # Try to extract the failing line from the traceback. The last
-    # "File "<eval>"" frame usually contains the offending source line.
-    failing_line = _extract_failing_line(tb_lines)
+    # Extract the user's failing source line from the traceback.
+    failing_line = _extract_failing_line(exc, code)
 
     # Build contextual hints.
     hints = []
@@ -265,8 +313,7 @@ def _format_error(exc, code, namespace):
     # Threading / replay controller access.
     if "BlockInvoke" in msg or "replay" in msg.lower():
         hints.append(
-            "use pyrenderdoc.Replay().BlockInvoke(callback) "
-            "to access the replay controller"
+            "use ctx.replay(callback) to access the replay controller"
         )
 
     # Generic AttributeError guidance.
@@ -275,6 +322,13 @@ def _format_error(exc, code, namespace):
             "use inspect(obj) to see available attributes, "
             "or search_api('name') to find the right API"
         )
+
+    # SyntaxError guidance.
+    if isinstance(exc, SyntaxError):
+        hint = "check Python syntax near the indicated position"
+        if exc.offset is not None:
+            hint += f" (column {exc.offset})"
+        hints.append(hint)
 
     # NameError with available globals.
     if isinstance(exc, NameError):
@@ -293,25 +347,44 @@ def _format_error(exc, code, namespace):
     }
 
 
-def _extract_failing_line(tb_lines):
-    """Extract the source line that caused the exception from traceback lines.
+def _extract_failing_line(exc, code=""):
+    """Extract the source line that caused the exception.
 
-    Walks the formatted traceback backwards looking for the last line that
-    came from our eval context. Returns None if no source line is found.
+    Prefers frames from the user's eval code (filename ``<eval>``). Falls
+    back to the last traceback frame if no eval frame is found. For syntax
+    errors, the offending line is pulled from the exception itself.
+
+    The ``<eval>`` frames have no backing source file, so linecache can't
+    populate frame_summary.line. Instead we use the frame's lineno to
+    index into the original source code.
+
+    exc  -- The caught exception.
+    code -- The original source code submitted by the user.
     """
-    # Formatted traceback lines alternate between "File ..." location lines
-    # and indented source lines. We want the last source line from <eval>.
-    found_eval = False
-    for line in reversed(tb_lines):
-        # Each element from format_exception may contain multiple lines.
-        for subline in reversed(line.splitlines()):
-            stripped = subline.strip()
-            if found_eval and stripped and not stripped.startswith("File "):
-                return stripped
-            if '<eval>' in subline:
-                found_eval = True
+    # SyntaxError carries the offending source line directly.
+    if isinstance(exc, SyntaxError) and exc.text:
+        return exc.text.strip()
 
-    return None
+    tb = exc.__traceback__
+    if tb is None:
+        return None
+
+    code_lines = code.splitlines() if code else []
+
+    # Walk frames, preferring <eval> frames over internal ones.
+    best = None
+    for frame_summary in traceback.extract_tb(tb):
+        if frame_summary.filename == "<eval>":
+            # Extract from original source since linecache can't find <eval>.
+            lineno = frame_summary.lineno
+            if code_lines and 1 <= lineno <= len(code_lines):
+                best = code_lines[lineno - 1].strip()
+            elif frame_summary.line:
+                best = frame_summary.line
+        elif best is None and frame_summary.line:
+            best = frame_summary.line
+
+    return best
 
 
 def _get_serializer_map():
@@ -382,6 +455,26 @@ def _serialize_result(value):
         except Exception:
             # Serialization failed; fall through to repr.
             pass
+
+    # Try attribute-based serialization for unknown SWIG types.
+    # SWIG objects can throw on attribute access, so be defensive.
+    try:
+        attrs = {}
+        for name in dir(value):
+            if name.startswith("_"):
+                continue
+            if name in ("thisown", "this"):
+                continue
+            try:
+                attr_val = getattr(value, name)
+                if not callable(attr_val):
+                    attrs[name] = _serialize_result(attr_val)
+            except Exception:
+                continue
+        if attrs:
+            return {"__type__": type_name, **attrs}
+    except Exception:
+        pass
 
     # Fallback for anything we don't recognize.
     return repr(value)

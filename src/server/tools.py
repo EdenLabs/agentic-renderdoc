@@ -8,7 +8,7 @@ _client = RenderDocClient()
 
 # --- eval ---
 
-@mcp.tool()
+@mcp.tool(name="Eval")
 def eval(code: str) -> dict:
     """Execute Python code in a live RenderDoc replay session.
 
@@ -18,19 +18,20 @@ def eval(code: str) -> dict:
 
     ACCESS MODEL
     ============
-    The global `pyrenderdoc` provides access to the capture context. To query
-    replay state, you must obtain a ReplayController through BlockInvoke:
+    The global `ctx` (HandlerContext) provides thread-safe replay access.
+    To query replay state, use ctx.replay(callback):
 
         def work(controller):
             controller.SetFrameEvent(eventId, True)
             state = controller.GetPipelineState()
             # ... query state ...
             return result
-        pyrenderdoc.Replay().BlockInvoke(work)
+        ctx.replay(work)
 
-    BlockInvoke runs your callback on the replay thread and blocks until it
-    completes. You MUST use this pattern for any ReplayController access.
-    Code outside BlockInvoke can use pyrenderdoc for UI operations.
+    ctx.replay() runs your callback on the replay thread with a
+    ReplayController argument, returns the callback's return value, and
+    properly propagates exceptions. You MUST use this pattern for any
+    ReplayController access.
 
     CURSOR MODEL
     ============
@@ -40,7 +41,14 @@ def eval(code: str) -> dict:
     - controller.SetFrameEvent(eventId, True) moves the cursor.
     - You MUST call SetFrameEvent before calling GetPipelineState or any
       other state query. Forgetting this is the most common mistake.
+      WARNING: GetPipelineState() will NOT error without SetFrameEvent —
+      it silently returns stale state from whatever event was last active.
+      Always call SetFrameEvent first inside every ctx.replay() callback.
     - The second argument (True) forces full pipeline state resolution.
+    - goto_event(eid) navigates the RenderDoc UI to an event. It does NOT
+      move the replay cursor. Only SetFrameEvent(eventId, True) inside a
+      ctx.replay() callback sets the replay cursor. Pipeline state queries
+      always reflect the last SetFrameEvent call, not goto_event.
 
     OBJECT GRAPH
     ============
@@ -56,6 +64,9 @@ def eval(code: str) -> dict:
             .next       -- next sibling action (or None)
             .previous   -- previous sibling action (or None)
             .customName -- user-defined marker name (empty string if none)
+            .GetName(ctx.structured_file) -- formatted display name
+                (e.g., "vkCmdDrawIndexed(36, 1, 0, 0, 0)"). Always
+                prefer this over customName for human-readable names.
             .numIndices, .numInstances, .indexOffset, .baseVertex
             .dispatchDimension -- [x, y, z] for compute dispatches
 
@@ -63,12 +74,42 @@ def eval(code: str) -> dict:
         controller.GetPipelineState() -> PipeState
         PipeState is API-agnostic. Key methods:
             .GetShader(stage)                   -> ResourceId
+                WARNING: GetShader(Compute) at a graphics draw call
+                returns the stale shader from the last dispatch, not
+                Null(). The serialize module filters this automatically,
+                but raw GetShader calls will see the stale ID. Check
+                the action's flags to know whether CS is relevant.
             .GetShaderReflection(stage)         -> ShaderReflection
-            .GetOutputTargets()                 -> list of render target descriptors
-            .GetDepthTarget()                   -> depth target descriptor
-            .GetReadOnlyResources(stage)        -> bound SRVs / textures
-            .GetReadWriteResources(stage)       -> bound UAVs / storage
-            .GetConstantBlocks(stage)           -> constant buffer bindings
+            .GetOutputTargets()                 -> list of Descriptor (direct)
+                rt.resource, rt.format, rt.firstMip, rt.numMips, etc.
+            .GetDepthTarget()                   -> Descriptor (direct)
+                depth.resource, depth.format, etc.
+            .GetReadOnlyResources(stage)        -> list of UsedDescriptor
+            .GetReadWriteResources(stage)       -> list of UsedDescriptor
+            .GetConstantBlocks(stage)           -> list of UsedDescriptor
+                UsedDescriptor wraps a Descriptor in .descriptor:
+                    ud.descriptor.resource   -- ResourceId
+                    ud.descriptor.byteOffset -- offset in buffer
+                    ud.descriptor.byteSize   -- size in bytes
+                Note: on Vulkan, VK_WHOLE_SIZE maps to byteSize =
+                18446744073709551615 (u64::MAX). This does NOT mean the
+                buffer is that large. Read the buffer's actual length
+                from controller.GetBuffers() and clamp accordingly.
+
+                UsedDescriptor also has an .access (DescriptorAccess) field:
+                    ud.access.arrayElement   -- index into the descriptor array
+                    ud.access.descriptorStore -- ResourceId of the backing store
+                    ud.access.stage          -- ShaderStage that accessed this
+                    ud.access.type           -- DescriptorType enum
+                For bindless renderers, GetReadWriteResources/GetReadOnlyResources
+                return only the descriptors actually accessed by the draw call.
+                Use ud.access.arrayElement to map back to the original array index.
+
+        Shader reflection containers:
+            refl.constantBlocks[i] is a ConstantBlock:
+                .name, .fixedBindNumber, .fixedBindSetOrSpace, .variables
+            refl.readOnlyResources[i] / readWriteResources[i] is a ShaderResource:
+                .name, .fixedBindNumber, .fixedBindSetOrSpace
             .GetViewport(index)                 -> viewport rect
             .GetScissor(index)                  -> scissor rect
             .GetPrimitiveTopology()             -> topology enum
@@ -77,14 +118,39 @@ def eval(code: str) -> dict:
             .GetIBuffer()                       -> index buffer binding
             .GetVBuffers()                      -> vertex buffer bindings
 
+        Depth/stencil test configuration (enable, writes, compare function)
+        is NOT available through the API-agnostic PipeState. Use the
+        API-specific state object instead:
+            controller.GetVulkanPipelineState().depthStencil
+            controller.GetD3D11PipelineState().outputMerger.depthStencilState
+
+        Push constant data (Vulkan only):
+            controller.GetVulkanPipelineState().pushconsts -> bytes
+            Decode with struct.unpack. Typically contains descriptor
+            indices or buffer offsets in bindless renderers.
+
     Raw data access:
         controller.GetBufferData(resourceId, offset, length) -> bytes
         controller.GetTextureData(resourceId, subresource)   -> bytes
+            subresource is an rd.Subresource(mip, slice, sample).
+            For the base mip of the first slice: rd.Subresource(0, 0, 0).
 
     Resource metadata:
         controller.GetTextures()  -> list of TextureDescription
+            Note: TextureDescription does not carry names. Use
+            get_resource_name(resource_id) to look up human-readable names.
         controller.GetBuffers()   -> list of BufferDescription
         controller.GetResources() -> list of ResourceDescription
+
+        Note: ResourceFormat uses .Name() (method) not .name (property)
+        for the format name string. The serialize module handles this
+        automatically.
+
+        Note: ResourceId is a one-way opaque handle. You can convert to
+        int via int(rid) or to string via serialize.resource_id(rid),
+        but there is no way to reconstruct a ResourceId from an integer.
+        Always hold onto live ResourceId objects within your ctx.replay()
+        callback rather than serializing and trying to reconstruct later.
 
     ACTION TREE
     ===========
@@ -117,10 +183,24 @@ def eval(code: str) -> dict:
         PushMarker, PopMarker, SetMarker,
         Indexed, Instanced, Indirect,
         ClearColor, ClearDepthStencil,
-        BeginPass, EndPass
+        BeginPass, EndPass, PassBoundary
+        Note: PassBoundary marks both Vulkan render pass boundaries
+        AND command buffer boundaries. To distinguish, check the
+        action name (e.g., "vkCmdBeginRenderPass" vs
+        "vkBeginCommandBuffer").
 
     MeshDataStage:
         VSIn, VSOut
+
+    SHADER REFLECTION TYPES
+    =======================
+    ShaderReflection.constantBlocks[i].variables[j].type is a
+    ShaderConstantType with:
+        .baseType   -- VarType enum (Float, Int, UInt, etc.)
+        .rows       -- number of rows (1 for scalars/vectors)
+        .columns    -- number of columns
+        .elements   -- array length (0 if not an array)
+        .members    -- list of sub-variables (for structs)
 
     AVAILABLE GLOBALS AND UTILITIES
     ===============================
@@ -129,7 +209,9 @@ def eval(code: str) -> dict:
     Modules:
         rd           -- the renderdoc module (import renderdoc as rd)
         qrd          -- the qrenderdoc module (UI types)
-        pyrenderdoc  -- the capture context global
+        ctx          -- HandlerContext:
+                        ctx.replay(callback) for replay access
+                        ctx.structured_file  for ActionDescription.GetName()
         serialize    -- type serialization (see below)
 
     Functions:
@@ -152,6 +234,9 @@ def eval(code: str) -> dict:
             Compute min, max, mean, count, nan_count, inf_count over
             a flat list of numbers. Quick buffer/texture inspection.
 
+        action_flags(flags)
+            Decode an ActionDescription.flags int into a list of flag name strings.
+
         goto_event(eid)
             Navigate the RenderDoc UI to a specific event.
 
@@ -159,7 +244,35 @@ def eval(code: str) -> dict:
             Open the texture viewer for a resource.
 
         highlight_drawcall(eid)
-            Navigate the event browser to highlight a draw call.
+            Alias for goto_event. Both call SetEventID under the hood.
+            Use whichever name reads better in context.
+
+        get_resource_name(resource_id)
+            Look up the human-readable name of a resource by its ResourceId.
+            Names come from ResourceDescription, not TextureDescription or
+            BufferDescription.
+
+        get_draw_calls()
+            Collect all leaf draw calls in the frame. Returns a flat list
+            of {"eventId": int, "name": str}. Handles the recursive action
+            tree walk internally. Works both inside and outside ctx.replay().
+
+        get_all_actions()
+            Flat walk of the entire action tree (markers, draws, dispatches,
+            clears, copies, etc.). Returns a list of {"eventId": int,
+            "name": str, "flags": [str]}. Useful for frame structure
+            exploration. Works both inside and outside ctx.replay().
+
+        describe_draw(eventId=eid)
+            One-shot comprehensive summary of a draw call. Returns event_id,
+            name, shaders, render_targets, depth_target, draw_params,
+            vertex_buffers, index_buffer, and push_constants in a single
+            dict. Works both inside and outside ctx.replay().
+
+        decode_push_constants(controller, stage)
+            Decode Vulkan push constant bytes against shader reflection.
+            Must be called inside a ctx.replay() callback. Returns a dict
+            with stage name, raw_hex string, and decoded variables list.
 
     Serialization:
         The `serialize` module converts RenderDoc C++ types to plain
@@ -179,20 +292,21 @@ def eval(code: str) -> dict:
       the result. You do not need to assign it or call return.
     - Return dicts or lists for structured data.
     - print() output is also captured and included in the response.
-    - If BlockInvoke's callback returns a value, you must capture it:
-          results = []
+    - ctx.replay(callback) returns the callback's return value directly:
           def work(controller):
               ...
-              results.append(data)
-          pyrenderdoc.Replay().BlockInvoke(work)
-          results[0]  # <-- last expression, becomes the result
+              return data
+          ctx.replay(work)  # <-- last expression, becomes the result
 
     EXAMPLES
     ========
 
     1. List all draw calls in the frame:
 
-        results = []
+        get_draw_calls()
+
+       Or manually (equivalent to what get_draw_calls does internally):
+
         def work(controller):
             def find_draws(actions):
                 draws = []
@@ -200,44 +314,57 @@ def eval(code: str) -> dict:
                     if a.flags & rd.ActionFlags.Drawcall:
                         draws.append({
                             "eventId": a.eventId,
-                            "name": a.customName or f"Draw({a.numIndices})",
+                            "name": a.GetName(ctx.structured_file),
                         })
                     draws.extend(find_draws(a.children))
                 return draws
-            results.extend(find_draws(controller.GetRootActions()))
-        pyrenderdoc.Replay().BlockInvoke(work)
-        results
+            return find_draws(controller.GetRootActions())
+        ctx.replay(work)
 
     2. Inspect pipeline state at a specific event:
 
-        results = []
         def work(controller):
             controller.SetFrameEvent(42, True)
             state = controller.GetPipelineState()
-            results.append(serialize.pipeline_state(state))
-        pyrenderdoc.Replay().BlockInvoke(work)
-        results[0]
+            return serialize.pipeline_state(state)
+        ctx.replay(work)
 
     3. Read constant buffer data for the pixel shader at event 100:
 
         import struct
-        results = []
         def work(controller):
             controller.SetFrameEvent(100, True)
             state = controller.GetPipelineState()
             cbs = state.GetConstantBlocks(rd.ShaderStage.Pixel)
             if cbs and cbs[0].descriptor.resource != rd.ResourceId.Null():
-                rid  = cbs[0].descriptor.resource
-                data = controller.GetBufferData(rid, 0, 256)
+                desc = cbs[0].descriptor
+                data = controller.GetBufferData(desc.resource, desc.byteOffset, desc.byteSize)
                 refl = state.GetShaderReflection(rd.ShaderStage.Pixel)
                 if refl and refl.constantBlocks:
-                    results.append(
-                        serialize.cbuffer_variables(
-                            refl.constantBlocks[0].variables, data
-                        )
+                    return serialize.cbuffer_variables(
+                        refl.constantBlocks[0].variables, data
                     )
-        pyrenderdoc.Replay().BlockInvoke(work)
-        results[0] if results else "no constant buffers bound"
+            return "no constant buffers bound"
+        ctx.replay(work)
+
+    4. Discover what methods a pipeline state object has:
+
+        def work(controller):
+            controller.SetFrameEvent(42, True)
+            state = controller.GetPipelineState()
+            return inspect(state)
+        ctx.replay(work)
+
+    5. Summarize a specific draw call:
+
+        describe_draw(eventId=42)
+
+    6. Decode push constants for the vertex shader at an event:
+
+        def work(controller):
+            controller.SetFrameEvent(100, True)
+            return decode_push_constants(controller, rd.ShaderStage.Vertex)
+        ctx.replay(work)
 
     ERRORS
     ======
@@ -251,12 +378,24 @@ def eval(code: str) -> dict:
     actually available, or use the search_api tool to look up the
     correct method name.
     """
-    return _client.send("eval", {"code": code})
+    try:
+        return _client.send("eval", {"code": code})
+    except (TimeoutError, OSError) as e:
+        return {
+            "ok"    : False,
+            "error" : {
+                "message" : f"Connection to RenderDoc timed out: {e}",
+                "hints"   : [
+                    "use instance(action='list') to check RenderDoc connectivity",
+                    "RenderDoc may have closed or the capture may have changed",
+                ],
+            },
+        }
 
 
 # --- search_api ---
 
-@mcp.tool()
+@mcp.tool(name="Search-API")
 def search_api(query: str) -> dict:
     """Search the RenderDoc Python API reference by name or concept.
 
@@ -280,7 +419,7 @@ def search_api(query: str) -> dict:
 
 # --- instance ---
 
-@mcp.tool()
+@mcp.tool(name="Instance")
 def instance(action: str, port: int | None = None) -> dict:
     """Manage connections to running RenderDoc instances.
 

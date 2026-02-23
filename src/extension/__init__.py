@@ -13,6 +13,53 @@ from .bridge    import BridgeServer
 from .api_index import build_index
 
 
+class _TrackedController:
+    """Thin proxy around a ReplayController that tracks API call ordering.
+
+    Delegates all attribute access to the wrapped controller. Watches for
+    SetFrameEvent and GetPipelineState to detect the common mistake of
+    querying pipeline state without first selecting an event.
+    """
+
+    def __init__(self, controller, warnings):
+        """Wrap a ReplayController and record warnings into the given list.
+
+        controller -- The real rd.ReplayController instance.
+        warnings   -- Mutable list to append warning strings to.
+        """
+        self._controller         = controller
+        self._warnings           = warnings
+        self._set_frame_called   = False
+        # Standard Python proxy convention. Lets introspection tools
+        # (like our inspect() utility) discover the real object.
+        self.__wrapped__         = controller
+
+    def SetFrameEvent(self, *args, **kwargs):
+        """Record that an event was selected, then forward the call."""
+        self._set_frame_called = True
+        return self._controller.SetFrameEvent(*args, **kwargs)
+
+    def GetPipelineState(self, *args, **kwargs):
+        """Warn if no event was selected, then forward the call."""
+        if not self._set_frame_called:
+            self._warnings.append(
+                "GetPipelineState() called without a prior "
+                "SetFrameEvent() in this replay callback. "
+                "The returned state may be stale or empty."
+            )
+        return self._controller.GetPipelineState(*args, **kwargs)
+
+    def __getattr__(self, name):
+        """Forward everything else to the real controller."""
+        return getattr(self._controller, name)
+
+    def __dir__(self):
+        """Expose the wrapped controller's attributes for introspection."""
+        names = set(dir(self._controller))
+        names.update(super().__dir__())
+        return sorted(names)
+
+
 class HandlerContext:
     """Shared context passed to every handler invocation.
 
@@ -26,13 +73,15 @@ class HandlerContext:
 
         ctx -- qrenderdoc.CaptureContext from the host.
         """
-        self.ctx              = ctx
-        self._server_port     = 0
-        self._capture_loaded  = False
-        self._api_type        = None
-        self._capture_path    = None
-        self._event_count     = 0
-        self._api_index       = None
+        self.ctx                = ctx
+        self._server_port       = 0
+        self._capture_loaded    = False
+        self._api_type          = None
+        self._capture_path      = None
+        self._event_count       = 0
+        self._api_index         = None
+        self._replay_controller = None
+        self._replay_warnings   = []
 
     @property
     def capture_loaded(self):
@@ -43,6 +92,11 @@ class HandlerContext:
     def api_index(self):
         """The pre-built API reference index, or None."""
         return self._api_index
+
+    @property
+    def structured_file(self):
+        """The capture's SDFile, needed for ActionDescription.GetName()."""
+        return self.ctx.GetStructuredFile()
 
     def on_capture_loaded(self):
         """Update state when a capture is opened.
@@ -74,6 +128,9 @@ class HandlerContext:
     def replay(self, callback):
         """Execute callback on the replay thread with the ReplayController.
 
+        Calls BlockInvoke from the bridge handler thread. The UI thread
+        remains free to process events.
+
         Blocks until the callback completes and returns its result.
         Raises if no capture is loaded or the callback throws.
 
@@ -82,14 +139,28 @@ class HandlerContext:
         if not self._capture_loaded:
             raise RuntimeError("no capture loaded")
 
+        # Reset warnings at the start of each top-level replay call.
+        self._replay_warnings = []
+
+        # Detect re-entrant calls. Nesting BlockInvoke deadlocks the
+        # replay thread. If we're already inside a callback, reuse the
+        # active controller directly. The proxy is already in place from
+        # the outer call.
+        if self._replay_controller is not None:
+            return callback(self._replay_controller)
+
         result    = [None]
         exception = [None]
 
         def wrapper(controller):
+            tracked = _TrackedController(controller, self._replay_warnings)
+            self._replay_controller = tracked
             try:
-                result[0] = callback(controller)
+                result[0] = callback(tracked)
             except Exception as e:
                 exception[0] = e
+            finally:
+                self._replay_controller = None
 
         self.ctx.Replay().BlockInvoke(wrapper)
 
