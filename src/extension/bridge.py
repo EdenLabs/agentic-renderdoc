@@ -41,7 +41,7 @@ class JsonSocket:
                 if not data:
                     return None
                 self._buffer += data
-            except (winsock.WinsockError, OSError):
+            except (winsock.SocketError, OSError):
                 return None
 
         line, self._buffer = self._buffer.split(b"\n", 1)
@@ -94,13 +94,13 @@ class BridgeServer:
 
         for port in self._port_range:
             try:
-                self._server_socket = winsock.WinsockSocket()
+                self._server_socket = winsock.Socket()
                 self._server_socket.bind("127.0.0.1", port)
                 self._server_socket.listen(5)
                 self._port = port
                 print(f"[Agentic] Listening on localhost:{port}")
                 break
-            except (winsock.WinsockError, OSError):
+            except (winsock.SocketError, OSError):
                 if self._server_socket:
                     try:
                         self._server_socket.close()
@@ -153,7 +153,7 @@ class BridgeServer:
                     daemon=True,
                 )
                 t.start()
-            except (winsock.WinsockError, OSError):
+            except (winsock.SocketError, OSError):
                 if self._running:
                     traceback.print_exc()
                 break
