@@ -6,6 +6,7 @@ requires-python = ">=3.10"
 license = "MIT"
 dependencies = [
     "mcp[cli]>=1.26",
+    "Pillow>=10.0",
 ]
 
 [project.scripts]

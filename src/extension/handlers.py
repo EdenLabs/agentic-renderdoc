@@ -1,6 +1,6 @@
 """Command handlers for the RenderDoc bridge extension.
 
-Three handlers: eval, api_index, instance_info.
+Handlers: eval, api_index, instance_info, get_texture, reload.
 """
 
 import traceback
@@ -146,6 +146,90 @@ def handle_instance_info(ctx, params):
             "event_count"    : event_count,
         },
     }
+
+
+# --- get_texture ---
+
+@handler(
+    "get_texture",
+    description="Read raw texture data as base64, with format metadata.",
+    schema={
+        "properties": {
+            "resource_id" : {"type": "string",  "description": "Texture resource ID (as returned by other commands)."},
+            "event_id"    : {"type": "integer", "description": "Event ID to set the replay cursor to before reading. Required for render targets. Omit for source textures."},
+            "mip"         : {"type": "integer", "description": "Mip level (default 0)."},
+            "slice"       : {"type": "integer", "description": "Array slice (default 0)."},
+            "sample"      : {"type": "integer", "description": "Multisample index (default 0)."},
+        },
+        "required": ["resource_id"],
+    },
+)
+def handle_get_texture(ctx, params):
+    """Read raw texture bytes and return them base64-encoded with format metadata.
+
+    Uses GetTextureData for a direct memory read rather than SaveTexture,
+    which triggers internal replays that can deadlock under agentic usage.
+    Format conversion (HDR mapping, channel extraction, BGRA swizzle) is
+    left to the MCP server where Pillow is available.
+    """
+    import base64
+
+    import renderdoc as rd
+    from . import serialize
+
+    resource_id = params.get("resource_id")
+    if not resource_id:
+        return {"ok": False, "error": "resource_id is required"}
+
+    event_id    = params.get("event_id")
+    mip         = params.get("mip", 0)
+    slice_param = params.get("slice", 0)
+    sample      = params.get("sample", 0)
+
+    def callback(controller):
+        # Find the matching texture by comparing serialized resource IDs.
+        tex = None
+        for t in controller.GetTextures():
+            if str(int(t.resourceId)) == resource_id:
+                tex = t
+                break
+
+        if tex is None:
+            return {"ok": False, "error": f"no texture found with resource id {resource_id}"}
+
+        # Position the replay cursor if an event was specified.
+        # Required for render targets whose contents depend on the event.
+        if event_id is not None:
+            controller.SetFrameEvent(event_id, True)
+
+        raw_bytes = controller.GetTextureData(
+            tex.resourceId,
+            rd.Subresource(mip, slice_param, sample),
+        )
+
+        if not raw_bytes:
+            return {"ok": False, "error": "GetTextureData returned empty data"}
+
+        mip_width  = max(1, tex.width >> mip)
+        mip_height = max(1, tex.height >> mip)
+
+        return {
+            "ok"   : True,
+            "data" : {
+                "raw"        : base64.b64encode(bytes(raw_bytes)).decode("ascii"),
+                "width"      : tex.width,
+                "height"     : tex.height,
+                "depth"      : tex.depth,
+                "format"     : serialize.format_description(tex.format),
+                "mip"        : mip,
+                "mip_width"  : mip_width,
+                "mip_height" : mip_height,
+                "slice"      : slice_param,
+                "sample"     : sample,
+            },
+        }
+
+    return ctx.replay(callback)
 
 
 # --- reload (dev only) ---
