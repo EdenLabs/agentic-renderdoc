@@ -5,6 +5,7 @@ Ported from orb-renderdoc v1.
 """
 from __future__ import annotations
 
+import _thread
 import json
 import threading
 import traceback
@@ -149,12 +150,13 @@ class BridgeServer:
 
                 print(f"[Agentic] Connection accepted ({count} active)")
 
-                t = threading.Thread(
-                    target=self._handle_connection,
-                    args=(conn,),
-                    daemon=True,
-                )
-                t.start()
+                # Use _thread.start_new_thread instead of threading.Thread to
+                # avoid _thread.start_joinable_thread, which has a use-after-free
+                # bug on Python 3.14 under GIL contention (the args tuple's
+                # ob_type gets corrupted).  Handler threads are fire-and-forget
+                # daemon-like threads that we never join, so the low-level API
+                # is sufficient.
+                _thread.start_new_thread(self._handle_connection, (conn,))
             except (winsock.SocketError, OSError):
                 if self._running:
                     traceback.print_exc()
