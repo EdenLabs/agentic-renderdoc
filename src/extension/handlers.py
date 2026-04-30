@@ -1,6 +1,6 @@
 """Command handlers for the RenderDoc bridge extension.
 
-Handlers: eval, api_index, instance_info, get_texture, reload.
+Handlers: eval, api_index, instance_info, get_texture, reload, shutdown.
 """
 from __future__ import annotations
 
@@ -151,6 +151,7 @@ def handle_instance_info(ctx: Any, params: dict[str, Any]) -> dict[str, Any]:
             "api_type"       : api_type,
             "capture_path"   : capture_path,
             "event_count"    : event_count,
+            "headless"       : getattr(ctx, "headless", False),
         },
     }
 
@@ -288,6 +289,49 @@ def handle_reload(ctx: Any, params: dict[str, Any]) -> dict[str, Any]:
             "handlers"  : list(old_handlers.keys()),
         },
     }
+
+
+# --- shutdown ---
+
+@handler(
+    "shutdown",
+    description="Request the bridge server to stop accepting connections and exit.",
+    schema={},
+)
+def handle_shutdown(ctx: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Trigger a graceful bridge shutdown.
+
+    For headless workers, this also tears down the replay thread and
+    closes the capture file. For the GUI extension, only the bridge
+    stops; RenderDoc itself keeps running.
+
+    The handler returns before the bridge actually stops; the caller
+    should treat the connection as closed shortly after receiving the
+    response.
+    """
+    bridge = getattr(ctx, "_bridge", None)
+
+    # Run the actual stop in a separate thread so the response can be
+    # written before the server socket closes.
+    if bridge is not None:
+        def _stop() -> None:
+            try:
+                bridge.stop()
+            except Exception:
+                traceback.print_exc()
+            # Headless: also tear down the replay controller and capture.
+            if getattr(ctx, "headless", False):
+                shutdown_fn = getattr(ctx, "shutdown", None)
+                if callable(shutdown_fn):
+                    try:
+                        shutdown_fn()
+                    except Exception:
+                        traceback.print_exc()
+
+        import threading
+        threading.Thread(target=_stop, daemon=True, name="agentic-shutdown").start()
+
+    return {"ok": True, "data": {"shutting_down": True}}
 
 
 # --- Internal helpers ---

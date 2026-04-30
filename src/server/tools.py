@@ -5,7 +5,11 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
+import re
 import struct
+import sys
+from pathlib import Path
 
 from PIL import Image as PILImage
 
@@ -16,6 +20,19 @@ from server.app import mcp
 from server.client import RenderDocClient
 
 _client = RenderDocClient()
+
+
+# Default capture-dump locations scanned by Instance(action='discover').
+# Override via AGENTIC_RENDERDOC_CAPTURE_DIRS (os.pathsep-separated).
+_DEFAULT_CAPTURE_DIRS_LINUX  = ["/tmp/RenderDoc"]
+_DEFAULT_CAPTURE_DIRS_WIN    = [r"%TEMP%\RenderDoc"]
+
+# RenderDoc's default capture filename template:
+# <exename>_<YYYY>.<MM>.<DD>_<HH>.<MM>_frame<N>.rdc
+_CAPTURE_NAME_RE = re.compile(
+    r"^(?P<exe>.+?)_(?P<date>\d{4}\.\d{2}\.\d{2})_"
+    r"(?P<time>\d{2}\.\d{2})_frame(?P<frame>\d+)\.rdc$"
+)
 
 
 # --- eval ---
@@ -390,6 +407,29 @@ def eval(code: str) -> dict:
     actually available, or use the search_api tool to look up the
     correct method name.
 
+    TIMEOUT AND CRASH RECOVERY
+    ==========================
+    The MCP server enforces per-command deadlines on every send. This
+    tool has a 90-second deadline (covers a full SetFrameEvent replay).
+    On timeout, the response is::
+
+        {"ok": false, "error": {
+            "kind": "worker_timeout",
+            "port": ...,
+            "headless": true,
+            "pid": ...,
+            "hints": ["force-terminate it with Instance(action='close', "
+                      "port=..., force=True)", ...]
+        }}
+
+    A timeout means the worker is wedged (typically a hung SetFrameEvent
+    in a replay driver). The replay state cannot be recovered — kill
+    the worker via Instance and reopen the capture in a fresh worker.
+
+    Similarly, if the worker crashes mid-call, the response has
+    ``"kind": "worker_dead"`` and the dead worker is automatically
+    untracked — you can immediately spawn a new one.
+
     PERFORMANCE AND STABILITY
     =========================
     RenderDoc's replay engine was designed for interactive, one-event-at-
@@ -427,19 +467,7 @@ def eval(code: str) -> dict:
     - get_draw_calls(), get_all_actions(), and describe_draw() are
       designed to be safe single-replay-per-call utilities.
     """
-    try:
-        return _client.send("eval", {"code": code})
-    except (TimeoutError, OSError) as e:
-        return {
-            "ok"    : False,
-            "error" : {
-                "message" : f"Connection to RenderDoc timed out: {e}",
-                "hints"   : [
-                    "use instance(action='list') to check RenderDoc connectivity",
-                    "RenderDoc may have closed or the capture may have changed",
-                ],
-            },
-        }
+    return _client.send("eval", {"code": code})
 
 
 # --- search_api ---
@@ -525,22 +553,13 @@ def get_texture(
     white_point: High end of the value range mapped to white (default
                  1.0). For HDR textures, values above this are clamped.
     """
-    try:
-        resp = _client.send("get_texture", {
-            "resource_id" : resource_id,
-            "event_id"    : event_id,
-            "mip"         : mip,
-            "slice"       : slice,
-            "sample"      : sample,
-        })
-    except (TimeoutError, OSError) as e:
-        return [TextContent(
-            type = "text",
-            text = json.dumps({
-                "ok"    : False,
-                "error" : f"connection to RenderDoc timed out: {e}",
-            }),
-        )]
+    resp = _client.send("get_texture", {
+        "resource_id" : resource_id,
+        "event_id"    : event_id,
+        "mip"         : mip,
+        "slice"       : slice,
+        "sample"      : sample,
+    })
 
     if not resp.get("ok"):
         return [TextContent(
@@ -709,22 +728,79 @@ def _decode_texture(raw: bytes, width: int, height: int, fmt: dict, black_point:
 # --- instance ---
 
 @mcp.tool(name="Instance")
-def instance(action: str, port: int | None = None) -> dict:
-    """Manage connections to running RenderDoc instances.
+def instance(
+    action : str,
+    port   : int | None = None,
+    file   : str | None = None,
+    force  : bool       = False,
+) -> dict:
+    """Manage RenderDoc replay instances — both live GUIs and headless workers.
 
-    Lists available instances, connects to a specific one, or disconnects.
-    On first use, automatically connects to the first available instance.
+    Live instances are running ``qrenderdoc`` UIs that loaded the
+    extension. Headless instances are subprocess workers spawned by
+    this tool that load a .rdc file directly via ``renderdoccmd
+    remoteserver``. Both speak the same protocol and appear in the
+    ``list`` output; the ``headless`` field distinguishes them.
 
-    action: One of "list", "connect", "disconnect".
-    port: Port to connect to. Required for "connect".
+    action  : One of:
+              - ``list``       : Probe the agentic port range for active instances
+                                 (live + headless workers). Returns metadata for each.
+              - ``discover``   : Scan known capture-dump locations for .rdc files
+                                 the agent could open. Does not spawn anything.
+              - ``open``       : Spawn a headless worker for ``file`` and connect
+                                 to it. The worker runs renderdoccmd remoteserver
+                                 in a child process.
+              - ``connect``    : Connect to an already-running instance on ``port``.
+              - ``disconnect`` : Drop the active connection. Does not stop the
+                                 underlying instance (use ``close`` for headless).
+              - ``close``      : Stop a headless worker spawned by this server.
+                                 Optionally ``force=True`` to SIGKILL immediately.
+
+    port    : Port to connect to / close. Required for ``connect`` and ``close``.
+    file    : Path to a .rdc capture file. Required for ``open``.
+    force   : For ``close``: skip graceful shutdown and SIGKILL immediately.
+
+    Capture discovery directories default to ``/tmp/RenderDoc`` (Linux) or
+    ``%TEMP%\\RenderDoc`` (Windows). Add extra paths via the
+    ``AGENTIC_RENDERDOC_CAPTURE_DIRS`` env var (os.pathsep-separated).
     """
     if action == "list":
+        # Reap any dead workers so they don't show up as zombie ports.
+        _client.reap_dead_workers()
         return _enrich_instances(_client.discover_instances())
-    elif action == "connect":
+
+    if action == "discover":
+        return {"captures": _discover_captures()}
+
+    if action == "open":
+        if not file:
+            return {"ok": False, "error": "file is required for open"}
+        try:
+            spawn = _client.spawn_headless_worker(file)
+        except RuntimeError as e:
+            return {"ok": False, "error": str(e)}
+
+        # Connect to the new worker.
+        _client.connect(spawn["port"])
+        info = spawn["info"]
+        return {
+            "ok"          : True,
+            "port"        : spawn["port"],
+            "remote_port" : spawn["remote_port"],
+            "pid"         : spawn["pid"],
+            "info"        : info,
+        }
+
+    if action == "connect":
         if port is None:
-            return {"error": "port is required for connect"}
+            return {"ok": False, "error": "port is required for connect"}
         _client.connect(port)
-        info   = _client.send("instance_info", {})
+        info = _client.send("instance_info", {})
+        # If instance_info itself failed (worker_timeout / worker_dead),
+        # propagate the structured error untouched. Don't graft
+        # other_instances onto an error response.
+        if not info.get("ok"):
+            return info
         others = [
             inst for inst in _client.discover_instances()
             if inst["port"] != port
@@ -732,11 +808,78 @@ def instance(action: str, port: int | None = None) -> dict:
         if others:
             info["other_instances"] = _enrich_instances(others)["instances"]
         return info
-    elif action == "disconnect":
+
+    if action == "disconnect":
         _client.disconnect()
         return {"status": "disconnected"}
+
+    if action == "close":
+        if port is None:
+            return {"ok": False, "error": "port is required for close"}
+        return _client.close_headless_worker(port, force=force)
+
+    return {"ok": False, "error": f"unknown action: {action}"}
+
+
+# --- Capture discovery ---
+
+def _discover_captures() -> list[dict]:
+    """Scan default + env-override dirs for .rdc files."""
+    dirs    = _capture_dirs()
+    results = []
+    seen    = set()
+
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for path in sorted(d.glob("*.rdc")):
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+
+            entry = {
+                "path"          : str(resolved),
+                "size_bytes"    : stat.st_size,
+                "mtime"         : stat.st_mtime,
+            }
+            exe = _captured_program(path.name)
+            if exe is not None:
+                entry["captured_program"] = exe
+            results.append(entry)
+
+    # Newest first.
+    results.sort(key=lambda e: e["mtime"], reverse=True)
+    return results
+
+
+def _capture_dirs() -> list[Path]:
+    """Resolve the list of capture directories to scan."""
+    extra = os.environ.get("AGENTIC_RENDERDOC_CAPTURE_DIRS", "")
+    extras = [Path(os.path.expandvars(p)) for p in extra.split(os.pathsep) if p]
+
+    if sys.platform == "win32":
+        defaults = [Path(os.path.expandvars(p)) for p in _DEFAULT_CAPTURE_DIRS_WIN]
     else:
-        return {"error": f"unknown action: {action}"}
+        defaults = [Path(p) for p in _DEFAULT_CAPTURE_DIRS_LINUX]
+
+    return defaults + extras
+
+
+def _captured_program(filename: str) -> str | None:
+    """Extract the captured executable name from a RenderDoc default filename."""
+    m = _CAPTURE_NAME_RE.match(filename)
+    if m is None:
+        return None
+    return m.group("exe")
 
 
 def _enrich_instances(instances: list[dict]) -> dict:

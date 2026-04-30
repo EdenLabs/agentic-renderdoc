@@ -35,6 +35,14 @@ def _try_import_qt():
     """Import the first available Qt-Network binding.
 
     Returns (QTcpServer, QTcpSocket, QHostAddress) or None.
+
+    Importing Qt for the first time pulls in libQt6Core, libQt6Network,
+    etc., which transitively makes the Vulkan loader register
+    librenderdoc.so as an implicit capture layer (via
+    /etc/vulkan/implicit_layer.d/renderdoc_capture.json on Linux). That
+    conflicts with our own use of the same .so for replay. Callers that
+    don't actually need Qt (i.e. force_threaded=True for headless
+    workers) MUST avoid this function.
     """
     for mod in ("PyQt6", "PySide6", "PySide2", "PyQt5"):
         try:
@@ -43,9 +51,6 @@ def _try_import_qt():
         except ImportError:
             continue
     return None
-
-
-_QT = _try_import_qt()
 
 
 # --- Shared dispatch ---
@@ -95,7 +100,10 @@ class _QtBridge:
 
     def start(self) -> None:
         """Bind to the first available port and start listening."""
-        QTcpServer, _QTcpSocket, QHostAddress = _QT
+        qt = _try_import_qt()
+        if qt is None:
+            raise RuntimeError("_QtBridge.start called but no Qt binding available")
+        QTcpServer, _QTcpSocket, QHostAddress = qt
         server = QTcpServer()
 
         for port in self._port_range:
@@ -317,14 +325,26 @@ class BridgeServer:
     which path is active.
     """
 
-    def __init__(self, ctx: Any, port_range: range = range(19876, 19886)) -> None:
-        if _QT is not None:
+    def __init__(
+        self,
+        ctx        : Any,
+        port_range : range = range(19876, 19886),
+        force_threaded: bool = False,
+    ) -> None:
+        # Only probe for Qt when we'd actually use it. Importing Qt
+        # transitively pulls librenderdoc.so in as a Vulkan capture
+        # layer, which conflicts with the replay role of the same .so
+        # in headless workers.
+        qt = None if force_threaded else _try_import_qt()
+
+        if qt is not None:
             self._impl : Any = _QtBridge(ctx, port_range)
         else:
-            print("[Agentic] Warning: no Qt bindings found (PyQt6/PySide6/"
-                  "PySide2/PyQt5) -- using threaded fallback. This path has "
-                  "a known Python 3.14 crash risk; install PySide6 or PyQt6 "
-                  "for the stable path.")
+            if not force_threaded:
+                print("[Agentic] Warning: no Qt bindings found (PyQt6/PySide6/"
+                      "PySide2/PyQt5) -- using threaded fallback. This path has "
+                      "a known Python 3.14 crash risk; install PySide6 or PyQt6 "
+                      "for the stable path.")
             self._impl = _ThreadedBridge(ctx, port_range)
 
     @property

@@ -880,6 +880,18 @@ def make_get_resource_name(ctx: Any) -> Callable[..., str]:
 
 # --- UI Helpers ---
 
+def _headless_no_ui() -> dict:
+    """Build a fresh structured error for UI calls in a headless worker.
+
+    Returned by reference would be unsafe — callers may mutate the
+    response dict before the bridge serializes it.
+    """
+    return {
+        "ok"    : False,
+        "error" : "headless: UI navigation is unavailable in this worker",
+    }
+
+
 def make_goto_event(ctx: Any) -> Callable[..., dict]:
     """Create a goto_event function bound to the given HandlerContext.
 
@@ -889,8 +901,12 @@ def make_goto_event(ctx: Any) -> Callable[..., dict]:
         """Navigate the RenderDoc UI to the specified event.
 
         eid -- Event ID to navigate to.
-        Returns a dict confirming the navigation.
+        Returns a dict confirming the navigation. In headless workers,
+        returns a structured "no UI" error instead of raising.
         """
+        if getattr(ctx, "headless", False):
+            return _headless_no_ui()
+
         def _nav() -> None:
             ctx.ctx.SetEventID([], eid, eid)
 
@@ -910,6 +926,9 @@ def make_view_texture(ctx: Any) -> Callable[..., dict]:
 
         resource_id -- ResourceId to display.
         """
+        if getattr(ctx, "headless", False):
+            return _headless_no_ui()
+
         def _view() -> None:
             pyrenderdoc = ctx.ctx
             if hasattr(pyrenderdoc, "ViewTextureDisplay"):
@@ -936,6 +955,9 @@ def make_highlight_drawcall(ctx: Any) -> Callable[..., dict]:
 
         eid -- Event ID of the draw call.
         """
+        if getattr(ctx, "headless", False):
+            return _headless_no_ui()
+
         def _nav() -> None:
             ctx.ctx.SetEventID([], eid, eid)
 
