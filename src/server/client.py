@@ -92,6 +92,32 @@ def _format_dead_error(e: "WorkerDeadError") -> dict:
     }
 
 
+def _find_qrenderdoc() -> str | None:
+    """Locate ``qrenderdoc.exe`` (or ``qrenderdoc`` on POSIX) for spawning.
+
+    Tries PATH first via ``shutil.which``, then the standard Windows
+    install location. Returns the resolved absolute path or None if not
+    found.
+    """
+    import shutil
+    name = "qrenderdoc.exe" if sys.platform == "win32" else "qrenderdoc"
+    found = shutil.which(name)
+    if found:
+        return found
+    if sys.platform == "win32":
+        candidates = [
+            r"C:\Program Files\RenderDoc\qrenderdoc.exe",
+            os.path.join(
+                os.environ.get("LOCALAPPDATA", ""),
+                "Programs", "RenderDoc", "qrenderdoc.exe",
+            ),
+        ]
+        for c in candidates:
+            if c and os.path.isfile(c):
+                return c
+    return None
+
+
 def _die_with_parent() -> None:
     """preexec_fn: ask the kernel to SIGKILL us when our parent dies.
 
@@ -533,23 +559,44 @@ class RenderDocClient:
                 f"{_PORT_RANGE.start}-{_PORT_RANGE.stop - 1}"
             )
 
-        remote_port = self._first_free_port(_REMOTE_PORT_RANGE)
-        if remote_port is None:
-            raise RuntimeError(
-                f"no free port in remote range "
-                f"{_REMOTE_PORT_RANGE.start}-{_REMOTE_PORT_RANGE.stop - 1}"
-            )
+        # On Windows the standard RenderDoc distribution does not ship
+        # ``renderdoc.pyd`` for external Python — the SWIG bindings are
+        # compiled into ``qrenderdoc.exe``. Run headless logic inside
+        # qrenderdoc's embedded Python via ``--script``; it exits via
+        # ``os._exit(0)`` before qrenderdoc ever opens its main UI, and
+        # uses in-process ``rd.OpenCaptureFile`` rather than
+        # ``renderdoccmd remoteserver``. No remote port needed.
+        windows_embedded = sys.platform == "win32"
 
-        cmd = [
-            sys.executable,
-            "-u",
-            "-m", "extension.headless",
-            str(capture.resolve()),
-            "--port-min",        str(bridge_port),
-            "--port-max",        str(bridge_port),
-            "--remote-port-min", str(remote_port),
-            "--remote-port-max", str(remote_port),
-        ]
+        if windows_embedded:
+            remote_port = None
+            qrd_path = _find_qrenderdoc()
+            if qrd_path is None:
+                raise RuntimeError(
+                    "could not locate qrenderdoc.exe (looked on PATH and "
+                    "%ProgramFiles%\\RenderDoc); install RenderDoc system-wide"
+                )
+            embedded_script = (
+                Path(__file__).resolve().parent.parent / "extension" / "embedded_headless.py"
+            )
+            cmd = [qrd_path, "--script", str(embedded_script)]
+        else:
+            remote_port = self._first_free_port(_REMOTE_PORT_RANGE)
+            if remote_port is None:
+                raise RuntimeError(
+                    f"no free port in remote range "
+                    f"{_REMOTE_PORT_RANGE.start}-{_REMOTE_PORT_RANGE.stop - 1}"
+                )
+            cmd = [
+                sys.executable,
+                "-u",
+                "-m", "extension.headless",
+                str(capture.resolve()),
+                "--port-min",        str(bridge_port),
+                "--port-max",        str(bridge_port),
+                "--remote-port-min", str(remote_port),
+                "--remote-port-max", str(remote_port),
+            ]
 
         env = os.environ.copy()
         # Make sure the extension/ package is importable.
@@ -571,14 +618,35 @@ class RenderDocClient:
         env["VK_LOADER_LAYERS_DISABLE"]                = "*"
         env["DISABLE_VK_LAYER_RENDERDOC_Capture_1"]    = "1"
 
-        proc = subprocess.Popen(
-            cmd,
-            stdin      = subprocess.DEVNULL,
-            stdout     = subprocess.DEVNULL,
-            stderr     = subprocess.PIPE,
-            env        = env,
-            preexec_fn = _die_with_parent if sys.platform.startswith("linux") else None,
-        )
+        if windows_embedded:
+            # qrenderdoc does not populate sys.argv inside --script, so
+            # the embedded script reads its config from env vars instead.
+            # PKG_PARENT is the directory the script prepends to sys.path
+            # so it can ``from extension.context import ...`` etc.
+            # (relying on __file__ would be flaky — qrenderdoc doesn't
+            # always populate it under --script).
+            env["AGENTIC_EMBEDDED_CAPTURE"]    = str(capture.resolve())
+            env["AGENTIC_EMBEDDED_PORT_MIN"]   = str(bridge_port)
+            env["AGENTIC_EMBEDDED_PORT_MAX"]   = str(bridge_port)
+            env["AGENTIC_EMBEDDED_PKG_PARENT"] = str(src_dir)
+            # Prevent qrenderdoc's AlwaysLoad_Extensions auto-load from
+            # binding a competing bridge on the same port. With Windows'
+            # SO_REUSEADDR semantics both bridges would coexist as
+            # listeners and incoming connections would routinely hit the
+            # GuiHandlerContext-backed one instead of ours. The
+            # extension's register() checks this var and no-ops.
+            env["AGENTIC_DISABLE_AUTOLOAD"]    = "1"
+
+        popen_kwargs = {
+            "stdin"  : subprocess.DEVNULL,
+            "stdout" : subprocess.DEVNULL,
+            "stderr" : subprocess.PIPE,
+            "env"    : env,
+        }
+        if sys.platform.startswith("linux"):
+            popen_kwargs["preexec_fn"] = _die_with_parent
+
+        proc = subprocess.Popen(cmd, **popen_kwargs)
         # Why stdin=DEVNULL: when this MCP server is launched via stdio
         # (Claude Code's default), our own stdin is the JSON-RPC socket.
         # If the worker inherits that fd, renderdoc/renderdoccmd may read
@@ -619,10 +687,32 @@ class RenderDocClient:
             self._reap_proc(proc)
             err_bytes = b"".join(stderr_buffer)
             err_text  = err_bytes.decode("utf-8", errors="replace").strip()
+
+            # Embedded-headless mode (qrenderdoc --script) doesn't write
+            # diagnostics to stderr — qrenderdoc is a GUI subprocess. Read
+            # the per-port log file the script writes instead. The path
+            # must match the one embedded_headless.py writes.
+            log_text = ""
+            if windows_embedded:
+                base = os.environ.get("TEMP") or os.environ.get("TMP") or "."
+                log_path = os.path.join(
+                    base, f"agentic-renderdoc-embedded-{bridge_port}.log"
+                )
+                try:
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                        log_text = f.read().strip()
+                except OSError:
+                    pass
+
+            if windows_embedded:
+                diag  = log_text or err_text or "<empty>"
+                label = "embedded-log"
+            else:
+                diag  = err_text or "<empty>"
+                label = "stderr"
             raise RuntimeError(
                 f"headless worker did not bind on {bridge_port} within "
-                f"{_WORKER_BIND_WAIT:.0f}s; stderr: "
-                f"{err_text or '<empty>'}"
+                f"{_WORKER_BIND_WAIT:.0f}s; {label}: {diag}"
             )
 
         # Worker is healthy. Stop buffering — drain thread keeps reading

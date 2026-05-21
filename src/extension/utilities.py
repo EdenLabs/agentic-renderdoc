@@ -5,15 +5,10 @@ and UI navigation helpers. Functions that need access to the replay controller
 or UI thread are bound to a HandlerContext via closures.
 """
 
-from __future__ import annotations
-
 import inspect as _inspect
 import math
 import struct
-from collections.abc import Callable
-from typing import Any
-
-
+from typing import Any, Callable, Dict, List, Optional, Tuple
 try:
     import renderdoc as rd
 except ImportError:
@@ -82,7 +77,7 @@ def _inspect_enum(obj: Any) -> dict:
     }
 
 
-def _extract_int_enum_members(cls: type) -> list[dict]:
+def _extract_int_enum_members(cls: type) -> List[dict]:
     """Extract named constants from a SWIG int-enum class.
 
     Returns a list of {name, value} dicts, or an empty list if this
@@ -185,7 +180,7 @@ def _inspect_object(obj: Any) -> dict:
     }
 
 
-def _get_signature(func: Any) -> str | None:
+def _get_signature(func: Any) -> Optional[str]:
     """Get a function's call signature as a string.
 
     Tries inspect.signature first. Falls back to parsing the first line
@@ -207,7 +202,7 @@ def _get_signature(func: Any) -> str | None:
     return None
 
 
-def _first_line(doc: str | None) -> str | None:
+def _first_line(doc: Optional[str]) -> Optional[str]:
     """Return the first non-empty line of a docstring, or None."""
     if not doc:
         return None
@@ -220,7 +215,7 @@ def _first_line(doc: str | None) -> str | None:
 
 # --- Pipeline State Diffing ---
 
-def _deep_diff(a: Any, b: Any) -> dict | None:
+def _deep_diff(a: Any, b: Any) -> Optional[dict]:
     """Recursively diff two dicts, returning only changed paths.
 
     For nested dicts, recurses and only includes keys whose subtrees
@@ -262,7 +257,7 @@ def _deep_diff(a: Any, b: Any) -> dict | None:
     return None
 
 
-def _annotate_resource_names(diff: dict, name_map: dict[str, str]) -> dict:
+def _annotate_resource_names(diff: dict, name_map: Dict[str, str]) -> dict:
     """Walk a diff dict and annotate leaf values that are resource IDs.
 
     For each leaf {"before": x, "after": y}, if x or y is a string
@@ -315,7 +310,7 @@ def make_diff_state(ctx: Any) -> Callable[..., dict]:
         """
         from . import serialize
 
-        def _snapshot_push_constants(controller: Any) -> str | None:
+        def _snapshot_push_constants(controller: Any) -> Optional[str]:
             """Try to capture Vulkan push constant data.
 
             Returns the raw bytes as a hex string, or None for
@@ -330,7 +325,7 @@ def make_diff_state(ctx: Any) -> Callable[..., dict]:
                 pass
             return None
 
-        def _snapshot_both(controller: Any) -> tuple[dict, dict, dict[str, str]]:
+        def _snapshot_both(controller: Any) -> Tuple[dict, dict, Dict[str, str]]:
             controller.SetFrameEvent(eid_a, True)
             state_a = serialize.pipeline_state(controller.GetPipelineState())
             push_a  = _snapshot_push_constants(controller)
@@ -483,7 +478,7 @@ def summarize_data(values: Any) -> dict:
 
 # --- Action Flags ---
 
-def action_flags(flags: Any) -> list[str]:
+def action_flags(flags: Any) -> List[str]:
     """Decode an ActionDescription flags bitmask into human-readable names.
 
     Introspects rd.ActionFlags to discover all known flag members, then
@@ -568,7 +563,7 @@ def decode_push_constants(controller: Any, stage: Any) -> dict:
 
 # --- Action Tree ---
 
-def make_get_draw_calls(ctx: Any) -> Callable[..., list[dict]]:
+def make_get_draw_calls(ctx: Any) -> Callable[..., List[dict]]:
     """Create a get_draw_calls function bound to the given HandlerContext.
 
     The returned closure walks the action tree and collects all leaf draw
@@ -577,7 +572,7 @@ def make_get_draw_calls(ctx: Any) -> Callable[..., list[dict]]:
 
     ctx -- HandlerContext with replay() access and structured_file.
     """
-    def get_draw_calls(controller: Any = None) -> list[dict]:
+    def get_draw_calls(controller: Any = None) -> List[dict]:
         """Collect all leaf draw calls in the frame.
 
         Recursively walks the action tree from GetRootActions(), filtering
@@ -591,8 +586,8 @@ def make_get_draw_calls(ctx: Any) -> Callable[..., list[dict]]:
 
         Returns a list of {"eventId": int, "name": str}.
         """
-        def _collect(ctrl: Any) -> list[dict]:
-            def _recurse(actions: list) -> list[dict]:
+        def _collect(ctrl: Any) -> List[dict]:
+            def _recurse(actions: list) -> List[dict]:
                 draws = []
                 for action in actions:
                     if action.flags & rd.ActionFlags.Drawcall:
@@ -619,7 +614,7 @@ def make_get_draw_calls(ctx: Any) -> Callable[..., list[dict]]:
     return get_draw_calls
 
 
-def make_get_all_actions(ctx: Any) -> Callable[..., list[dict]]:
+def make_get_all_actions(ctx: Any) -> Callable[..., List[dict]]:
     """Create a get_all_actions function bound to the given HandlerContext.
 
     The returned closure walks the entire action tree and returns every
@@ -629,7 +624,7 @@ def make_get_all_actions(ctx: Any) -> Callable[..., list[dict]]:
 
     ctx -- HandlerContext with replay() access and structured_file.
     """
-    def get_all_actions(controller: Any = None) -> list[dict]:
+    def get_all_actions(controller: Any = None) -> List[dict]:
         """Collect all actions in the frame as a flat list.
 
         Recursively walks the action tree from GetRootActions(), emitting
@@ -643,8 +638,8 @@ def make_get_all_actions(ctx: Any) -> Callable[..., list[dict]]:
 
         Returns a list of {"eventId": int, "name": str, "flags": [str]}.
         """
-        def _collect(ctrl: Any) -> list[dict]:
-            def _recurse(actions: list) -> list[dict]:
+        def _collect(ctrl: Any) -> List[dict]:
+            def _recurse(actions: list) -> List[dict]:
                 result = []
                 for a in actions:
                     result.append({
@@ -682,7 +677,7 @@ def make_describe_draw(ctx: Any) -> Callable[..., dict]:
 
     ctx -- HandlerContext with replay() access and structured_file.
     """
-    def describe_draw(controller: Any = None, eventId: int | None = None) -> dict:
+    def describe_draw(controller: Any = None, eventId: Optional[int] = None) -> dict:
         """Summarize pipeline state and draw parameters at an event.
 
         Moves the replay cursor to the given event, snapshots the full
@@ -848,7 +843,7 @@ def make_get_resource_name(ctx: Any) -> Callable[..., str]:
 
     ctx -- HandlerContext with replay() access.
     """
-    cache: dict[Any, str] = {}
+    cache: Dict[Any, str] = {}
 
     def _build_cache(controller: Any) -> None:
         """Fetch all resources and populate the name cache."""
@@ -969,7 +964,7 @@ def make_highlight_drawcall(ctx: Any) -> Callable[..., dict]:
 
 # --- Binding ---
 
-def bind_utilities(ctx: Any) -> dict[str, Any]:
+def bind_utilities(ctx: Any) -> Dict[str, Any]:
     """Create all utility functions bound to the given HandlerContext.
 
     Returns a dict suitable for merging into the eval handler's

@@ -3,9 +3,7 @@
 Registers the CaptureViewer and starts the TCP bridge server.
 RenderDoc calls register() on load and unregister() on shutdown.
 """
-from __future__ import annotations
-
-from typing import Any
+from typing import Any, Optional
 
 # qrenderdoc / renderdoc are only available when this package is loaded
 # inside the RenderDoc GUI. The headless worker entry point imports
@@ -19,8 +17,8 @@ from .context import GuiHandlerContext, HandlerContext
 
 # --- Module state ---
 
-_extension : Any           = None
-_server    : BridgeServer | None = None
+_extension : Any                    = None
+_server    : Optional[BridgeServer] = None
 
 
 def register(version: str, ctx: Any) -> None:
@@ -28,8 +26,23 @@ def register(version: str, ctx: Any) -> None:
 
     Sets up the handler context, registers the CaptureViewer, and
     starts the TCP bridge server.
+
+    Skipped entirely when ``AGENTIC_DISABLE_AUTOLOAD`` is set in the
+    environment. This is used by the Windows embedded-headless entry
+    point (see ``embedded_headless.py``), which runs as
+    ``qrenderdoc --script`` and provides its own ``EmbeddedHeadlessContext``
+    plus bridge. Without this skip, qrenderdoc's ``AlwaysLoad_Extensions``
+    auto-load would race the embedded script and bind a second bridge
+    on the same port (Windows' SO_REUSEADDR allows hijacking-style
+    coexistence), with incoming connections being routed to the
+    GUI-context bridge instead of the embedded one.
     """
     global _extension, _server
+
+    import os
+    if os.environ.get("AGENTIC_DISABLE_AUTOLOAD"):
+        print("[Agentic] AGENTIC_DISABLE_AUTOLOAD set; skipping auto-load")
+        return
 
     print(f"[Agentic] Registering (RenderDoc {version})")
 

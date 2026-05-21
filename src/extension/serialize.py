@@ -4,10 +4,7 @@ Converts RenderDoc's SWIG-wrapped types into plain dicts suitable for
 JSON transport. Ported from orb-renderdoc v1.
 """
 
-from __future__ import annotations
-
-from typing import Any
-
+from typing import Any, List
 import renderdoc as rd
 
 
@@ -61,7 +58,7 @@ def api_properties(props: rd.APIProperties) -> dict:
 
 # --- Actions ---
 
-def action_flags(flags: rd.ActionFlags) -> list[str]:
+def action_flags(flags: rd.ActionFlags) -> List[str]:
     """Convert an ActionFlags bitmask to a list of flag name strings."""
     result = []
 

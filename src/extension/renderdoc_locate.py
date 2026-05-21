@@ -24,14 +24,13 @@ with the candidate directory prepended to ``sys.path`` and the matching
 shared library preloaded with ``RTLD_GLOBAL``. The first candidate that
 imports cleanly wins.
 """
-from __future__ import annotations
-
 import ctypes
 import importlib
 import os
 import shutil
 import sys
 from pathlib import Path
+from typing import List, Optional, Set, Tuple
 
 
 # --- Platform-specific names ---
@@ -81,7 +80,7 @@ def setup() -> dict:
             "RenderDoc install root, or install RenderDoc system-wide."
         )
 
-    tried: list[str] = []
+    tried = []  # type: List[str]
     for python_dir, library_path in candidates:
         try:
             _try_load(python_dir, library_path)
@@ -102,7 +101,7 @@ def setup() -> dict:
 
 # --- Internals ---
 
-def _try_load(python_dir: Path, library_path: Path | None) -> None:
+def _try_load(python_dir: Path, library_path: Optional[Path]) -> None:
     """Attempt to import the renderdoc module from python_dir.
 
     Preloads librenderdoc with RTLD_GLOBAL when a path is supplied so
@@ -149,9 +148,9 @@ def _iter_candidates():
     optional — when omitted, no preload is performed and we trust the
     OS dynamic linker.
     """
-    seen: set[tuple[str, str]] = set()
+    seen = set()  # type: Set[Tuple[str, str]]
 
-    def emit(python_dir: Path, library_path: Path | None):
+    def emit(python_dir: Path, library_path: Optional[Path]):
         key = (str(python_dir), str(library_path) if library_path else "")
         if key in seen:
             return None
@@ -250,7 +249,7 @@ def _has_python_module(d: Path) -> bool:
     return False
 
 
-def _find_library_under(root: Path) -> Path | None:
+def _find_library_under(root: Path) -> Optional[Path]:
     """Locate the librenderdoc shared library under root, if present."""
     candidates = (
         root / "lib" / _LIB_NAME,

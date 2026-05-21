@@ -16,13 +16,15 @@ controller. Two variants exist:
 Both expose the same surface so handlers and bind_utilities() are
 agnostic to which environment they're in.
 """
-from __future__ import annotations
-
-import concurrent.futures
-import queue
 import threading
-from collections.abc import Callable
-from typing          import Any
+from typing import Any, Callable, List, Optional, Tuple
+
+# ``concurrent.futures`` and ``queue`` transitively import ``socket`` via
+# ``multiprocessing``. qrenderdoc's embedded Python 3.6 ships without
+# ``_socket``, so a module-level import here would block the whole
+# extension from loading inside qrenderdoc — even though only the
+# external-worker HeadlessHandlerContext actually uses them. Import
+# them lazily in that class's methods instead.
 
 from .api_index import build_index
 
@@ -35,7 +37,7 @@ class _TrackedController:
     querying pipeline state without first selecting an event.
     """
 
-    def __init__(self, controller: Any, warnings: list[str]) -> None:
+    def __init__(self, controller: Any, warnings: List[str]) -> None:
         self._controller         = controller
         self._warnings           = warnings
         self._set_frame_called   = False
@@ -57,7 +59,7 @@ class _TrackedController:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._controller, name)
 
-    def __dir__(self) -> list[str]:
+    def __dir__(self) -> List[str]:
         names = set(dir(self._controller))
         names.update(super().__dir__())
         return sorted(names)
@@ -79,11 +81,11 @@ class HandlerContext:
         self._server_port       : int         = 0
         self._capture_loaded    : bool        = False
         self._api_type          : Any         = None
-        self._capture_path      : str | None  = None
+        self._capture_path      : Optional[str]  = None
         self._event_count       : int         = 0
-        self._api_index         : dict | None = None
+        self._api_index         : Optional[dict] = None
         self._replay_controller : Any         = None
-        self._replay_warnings   : list[str]   = []
+        self._replay_warnings   : List[str]   = []
         self._bridge            : Any         = None
 
     # --- Public properties ---
@@ -93,7 +95,7 @@ class HandlerContext:
         return self._capture_loaded
 
     @property
-    def api_index(self) -> dict | None:
+    def api_index(self) -> Optional[dict]:
         return self._api_index
 
     @property
@@ -224,17 +226,24 @@ class HeadlessHandlerContext(HandlerContext):
 
     def __init__(self, remote_port: int, capture_path: str) -> None:
         super().__init__()
+        # Lazy imports — see module docstring for why these can't be at
+        # module scope (qrenderdoc Python ships without _socket).
+        import concurrent.futures as _futures
+        import queue as _queue
+        self._futures_mod = _futures
+        self._queue_mod   = _queue
+
         self._remote_port    = remote_port
         self._capture_path   = capture_path
         self._remote_server  : Any = None  # populated by replay thread
         self._controller_raw : Any = None  # populated by replay thread
         self._structured_file: Any = None
 
-        self._queue: "queue.Queue[Any]" = queue.Queue()
+        self._queue = _queue.Queue()
         self._stop = threading.Event()
         # Setup completion signal. Set to True on success, set with an
         # exception on failure. Constructor blocks on it.
-        self._setup_done: concurrent.futures.Future[bool] = concurrent.futures.Future()
+        self._setup_done = _futures.Future()
 
         self._replay_thread = threading.Thread(
             target = self._replay_loop,
@@ -274,7 +283,7 @@ class HeadlessHandlerContext(HandlerContext):
         """
         self._capture_loaded = True
 
-        def _populate(controller: Any) -> tuple[Any, int, Any]:
+        def _populate(controller: Any) -> Tuple[Any, int, Any]:
             try:
                 api_type = controller.GetAPIProperties().pipelineType
             except Exception:
@@ -314,7 +323,7 @@ class HeadlessHandlerContext(HandlerContext):
         if self._replay_controller is not None:
             return callback(self._replay_controller)
 
-        future: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        future = self._futures_mod.Future()
 
         def worker(controller: Any) -> Any:
             tracked = _TrackedController(controller, self._replay_warnings)
@@ -365,7 +374,7 @@ class HeadlessHandlerContext(HandlerContext):
         while True:
             try:
                 item = self._queue.get_nowait()
-            except queue.Empty:
+            except self._queue_mod.Empty:
                 break
             if item is None:
                 continue
@@ -452,7 +461,7 @@ class HeadlessHandlerContext(HandlerContext):
             while not self._stop.is_set():
                 try:
                     item = self._queue.get(timeout=0.5)
-                except queue.Empty:
+                except self._queue_mod.Empty:
                     continue
 
                 if item is None:
@@ -483,6 +492,230 @@ class HeadlessHandlerContext(HandlerContext):
             except Exception:
                 pass
             self._remote_server = None
+
+
+class EmbeddedHeadlessContext(HandlerContext):
+    """Context for in-process replay inside qrenderdoc's embedded Python.
+
+    Used by the Windows headless path, where ``renderdoc.pyd`` is not
+    shipped as a standalone Python module — the bindings are only
+    reachable from inside ``qrenderdoc.exe`` (via ``qrenderdoc --script``).
+    Opens the capture locally via ``rd.OpenCaptureFile`` / ``OpenCapture``
+    rather than ``renderdoccmd remoteserver``, mirroring the path the
+    GUI uses for its own captures.
+
+    Same single-thread discipline as ``HeadlessHandlerContext``: one
+    dedicated replay thread owns every renderdoc call from OpenCapture
+    through CloseCapture. There is no heartbeat — there's no remote
+    connection to keep alive.
+
+    Synchronisation uses ``threading.Event`` rather than
+    ``concurrent.futures.Future`` because qrenderdoc's embedded Python 3.6
+    ships without ``_socket``, and ``concurrent.futures`` transitively
+    imports ``socket`` via ``multiprocessing``.
+
+    capture_path -- Absolute path to the .rdc file to open in-process.
+    """
+
+    headless = True
+
+    def __init__(self, capture_path: str) -> None:
+        super().__init__()
+        # ``queue`` is safe to import in qrenderdoc's Python (no _socket
+        # in its transitive imports).
+        import queue as _queue
+        self._queue_mod = _queue
+
+        self._capture_path    = capture_path
+        self._cap_file        : Any = None  # populated by replay thread
+        self._controller_raw  : Any = None  # populated by replay thread
+        self._structured_file : Any = None
+
+        self._queue = _queue.Queue()
+        self._stop  = threading.Event()
+
+        # Setup signal: set on success or after setup failure. Caller
+        # checks ``_setup_error`` after waiting.
+        self._setup_done  = threading.Event()
+        self._setup_error : Optional[BaseException] = None
+
+        self._replay_thread = threading.Thread(
+            target = self._replay_loop,
+            name   = "agentic-replay-embedded",
+            daemon = True,
+        )
+        self._replay_thread.start()
+
+        # Block the constructor until setup completes. Re-raise any
+        # setup exception in the caller's thread.
+        self._setup_done.wait()
+        if self._setup_error is not None:
+            raise self._setup_error
+
+    @property
+    def structured_file(self) -> Any:
+        return self._structured_file
+
+    def on_capture_loaded(self) -> None:
+        """Populate capture metadata and build the API index.
+
+        Mirrors HeadlessHandlerContext.on_capture_loaded. The metadata
+        read is issued via replay() so it runs on the replay thread.
+        """
+        self._capture_loaded = True
+
+        def _populate(controller: Any) -> Tuple[Any, int, Any]:
+            try:
+                api_type = controller.GetAPIProperties().pipelineType
+            except Exception:
+                api_type = None
+
+            try:
+                last_action = controller.GetLastAction()
+                last_eid    = last_action.eventId if last_action is not None else -1
+            except Exception:
+                # GetLastAction() may not be available on older RenderDoc
+                # builds; fall back to a recursive walk.
+                try:
+                    last_eid = _last_event_id(controller.GetRootActions())
+                except Exception:
+                    last_eid = -1
+
+            try:
+                sdfile = controller.GetStructuredFile()
+            except Exception:
+                sdfile = None
+
+            return (api_type, last_eid + 1 if last_eid >= 0 else 0, sdfile)
+
+        api_type, event_count, sdfile = self.replay(_populate)
+        self._api_type        = api_type
+        self._event_count     = event_count
+        self._structured_file = sdfile
+
+        if self._api_index is None:
+            self._api_index = build_index()
+
+    def on_capture_closed(self) -> None:
+        super().on_capture_closed()
+        self._structured_file = None
+
+    def replay(self, callback: Callable[[Any], Any]) -> Any:
+        if self._stop.is_set():
+            raise RuntimeError("worker is shutting down")
+
+        self._replay_warnings = []
+
+        # Re-entrant: utilities may call replay() from within a callback.
+        if self._replay_controller is not None:
+            return callback(self._replay_controller)
+
+        # threading.Event + a result dict, since concurrent.futures isn't
+        # importable inside qrenderdoc (see module docstring).
+        result : dict = {}
+        done   = threading.Event()
+
+        def wrapper(controller: Any) -> None:
+            tracked = _TrackedController(controller, self._replay_warnings)
+            self._replay_controller = tracked
+            try:
+                result["value"] = callback(tracked)
+            except BaseException as e:
+                result["error"] = e
+            finally:
+                self._replay_controller = None
+                done.set()
+
+        self._queue.put(wrapper)
+        done.wait()
+
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
+
+    def invoke_ui(self, callback: Callable[[], None]) -> None:
+        raise RuntimeError("UI is not available in embedded headless mode")
+
+    def shutdown(self) -> None:
+        """Signal the replay thread to exit and reap it. Idempotent."""
+        if self._stop.is_set():
+            return
+
+        self._stop.set()
+        self._queue.put(None)  # sentinel
+
+        if self._replay_thread.is_alive():
+            self._replay_thread.join(timeout=15.0)
+
+        # Drain any queued work the replay loop didn't process.
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except self._queue_mod.Empty:
+                break
+            # Queued items here are wrapper callables that handle their
+            # own result-passing via shared closures — there's nothing
+            # to cancel from the outside; the wait()s on the caller side
+            # will block until shutdown is observed.
+
+        self._capture_loaded = False
+
+    def _replay_loop(self) -> None:
+        """Open the capture, drain the queue, tear down. All on this thread."""
+        # --- Phase 1: setup ---
+        import renderdoc as rd
+
+        try:
+            cap_file = rd.OpenCaptureFile()
+            status = cap_file.OpenFile(self._capture_path, "", None)
+            if status.code != rd.ResultCode.Succeeded:
+                raise RuntimeError("OpenFile failed: " + str(status.code))
+
+            status, controller = cap_file.OpenCapture(rd.ReplayOptions(), None)
+            if status.code != rd.ResultCode.Succeeded:
+                try:
+                    cap_file.Shutdown()
+                except Exception:
+                    pass
+                raise RuntimeError("OpenCapture failed: " + str(status.code))
+
+            self._cap_file       = cap_file
+            self._controller_raw = controller
+        except BaseException as e:
+            self._setup_error = e
+            self._setup_done.set()
+            return
+
+        self._setup_done.set()
+
+        # --- Phase 2: work ---
+        try:
+            while not self._stop.is_set():
+                try:
+                    item = self._queue.get(timeout=0.5)
+                except self._queue_mod.Empty:
+                    continue
+                if item is None:
+                    break
+                try:
+                    item(self._controller_raw)
+                except BaseException:
+                    import traceback
+                    traceback.print_exc()
+        finally:
+            # --- Phase 3: teardown (same thread that opened them) ---
+            try:
+                if self._controller_raw is not None:
+                    self._controller_raw.Shutdown()
+            except Exception:
+                pass
+            self._controller_raw = None
+            try:
+                if self._cap_file is not None:
+                    self._cap_file.Shutdown()
+            except Exception:
+                pass
+            self._cap_file = None
 
 
 def _last_event_id(actions: list) -> int:

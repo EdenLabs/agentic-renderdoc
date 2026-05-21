@@ -4,13 +4,9 @@ Introspects the live `renderdoc` module at startup to build a searchable
 index of all classes, methods, enums, and their docstrings.
 """
 
-from __future__ import annotations
-
 import inspect
 import re
-from typing import Any
-
-
+from typing import Any, List, Optional, Set
 # --- Synonyms ---
 
 # Maps common search terms to related API names. When a user searches for a
@@ -112,7 +108,7 @@ _SYNONYMS = {
 
 # --- Public API ---
 
-def build_index() -> list[dict]:
+def build_index() -> List[dict]:
     """Build the API reference index by introspecting the renderdoc module.
 
     Returns a list of entries, each with:
@@ -131,7 +127,7 @@ def build_index() -> list[dict]:
     return entries
 
 
-def search_index(index: list[dict], query: str) -> list[dict]:
+def search_index(index: List[dict], query: str) -> List[dict]:
     """Search the index for entries matching the query string.
 
     Matches against name and docstring content. Case-insensitive.
@@ -175,7 +171,7 @@ _CAMEL_SPLIT_RE = re.compile(
 )
 
 
-def _tokenize_name(name: str) -> list[str]:
+def _tokenize_name(name: str) -> List[str]:
     """Split an API name into lowercase tokens by CamelCase and underscores.
 
     Handles PascalCase, camelCase, SCREAMING_SNAKE, and mixed identifiers.
@@ -193,7 +189,7 @@ def _tokenize_name(name: str) -> list[str]:
     return tokens
 
 
-def _tokenize_query(query: str) -> list[str]:
+def _tokenize_query(query: str) -> List[str]:
     """Split a search query into lowercase tokens.
 
     Handles both natural language ("pipeline state") and identifier-style
@@ -324,7 +320,7 @@ def _score_query(entry: dict, query_lower: str) -> int:
     return 0
 
 
-def _score_tokens(query_tokens: list[str], name_tokens: list[str]) -> int:
+def _score_tokens(query_tokens: List[str], name_tokens: List[str]) -> int:
     """Score query tokens against name tokens.
 
     Returns 50 if all query tokens exactly match a name token, 45 if all
@@ -408,7 +404,7 @@ def _score_fuzzy(entry: dict, query_lower: str) -> int:
 
 # --- Module Walker ---
 
-def _walk_module(obj: Any, prefix: str, entries: list[dict], visited: set[int]) -> None:
+def _walk_module(obj: Any, prefix: str, entries: List[dict], visited: Set[int]) -> None:
     """Recursively enumerate members of a module or class.
 
     Walks public attributes of obj, classifying each as a class, enum,
@@ -459,7 +455,7 @@ def _walk_module(obj: Any, prefix: str, entries: list[dict], visited: set[int]) 
             _walk_class(member, qualified, entries, visited)
 
 
-def _walk_class(cls: type, prefix: str, entries: list[dict], visited: set[int]) -> None:
+def _walk_class(cls: type, prefix: str, entries: List[dict], visited: Set[int]) -> None:
     """Walk the members of a class, emitting methods and properties.
 
     Unlike _walk_module, this checks for property descriptors using
@@ -528,7 +524,7 @@ def _walk_class(cls: type, prefix: str, entries: list[dict], visited: set[int]) 
             })
 
 
-def _walk_enum_members(enum_cls: type, prefix: str, entries: list[dict]) -> None:
+def _walk_enum_members(enum_cls: type, prefix: str, entries: List[dict]) -> None:
     """Extract individual values from a SWIG-generated enum type.
 
     SWIG enums expose their members via a __members__ dict mapping
@@ -564,7 +560,7 @@ def _walk_enum_members(enum_cls: type, prefix: str, entries: list[dict]) -> None
 
 # --- Classification ---
 
-def _classify(obj: Any) -> str | None:
+def _classify(obj: Any) -> Optional[str]:
     """Classify a Python object as class, method, enum, or None.
 
     RenderDoc enums are SWIG-generated IntEnum-like types. They are
@@ -621,7 +617,7 @@ def _is_property_descriptor(obj: Any) -> bool:
 
 # --- Signature Extraction ---
 
-def _get_signature(obj: Any) -> str | None:
+def _get_signature(obj: Any) -> Optional[str]:
     """Extract a signature string from a callable.
 
     Tries inspect.signature first. When that fails (common for
@@ -650,7 +646,7 @@ _SWIG_SIG_RE = re.compile(
 )
 
 
-def _parse_docstring_signature(obj: Any) -> str | None:
+def _parse_docstring_signature(obj: Any) -> Optional[str]:
     """Parse a signature from the first line of a SWIG-style docstring.
 
     Returns a signature string like "(arg1, arg2) -> ReturnType", or

@@ -15,14 +15,11 @@ Two implementations share a common dispatch:
                      Python/generated_cases.c.h tuple_alloc). Used only
                      when no Qt bindings are importable.
 """
-from __future__ import annotations
-
 import _thread
 import json
 import threading
 import traceback
-from typing import Any
-
+from typing import Any, Dict, Optional
 from .handlers import HANDLERS
 from .          import winsock
 
@@ -55,7 +52,7 @@ def _try_import_qt():
 
 # --- Shared dispatch ---
 
-def _dispatch(ctx: Any, request: dict[str, Any]) -> dict[str, Any]:
+def _dispatch(ctx: Any, request: Dict[str, Any]) -> Dict[str, Any]:
     """Run a single request's handler.
 
     Caller is responsible for serializing dispatches -- the replay API
@@ -90,12 +87,12 @@ class _QtBridge:
     def __init__(self, ctx: Any, port_range: range) -> None:
         self._ctx        = ctx
         self._port_range = port_range
-        self._port       : int | None         = None
+        self._port       : Optional[int]         = None
         self._server     : Any                = None
-        self._buffers    : dict[Any, bytearray] = {}
+        self._buffers    : Dict[Any, bytearray] = {}
 
     @property
-    def port(self) -> int | None:
+    def port(self) -> Optional[int]:
         return self._port
 
     def start(self) -> None:
@@ -188,7 +185,7 @@ class JsonSocket:
         self._conn   = conn
         self._buffer = b""
 
-    def read_request(self) -> dict[str, Any] | None:
+    def read_request(self) -> Optional[Dict[str, Any]]:
         """Read one newline-delimited JSON request. Blocks."""
         while b"\n" not in self._buffer:
             try:
@@ -202,7 +199,7 @@ class JsonSocket:
         line, self._buffer = self._buffer.split(b"\n", 1)
         return json.loads(line.decode("utf-8"))
 
-    def write_response(self, response: dict[str, Any]) -> None:
+    def write_response(self, response: Dict[str, Any]) -> None:
         """Write a JSON response followed by a newline."""
         data = json.dumps(response, separators=(",", ":")) + "\n"
         self._conn.sendall(data.encode("utf-8"))
@@ -214,16 +211,16 @@ class _ThreadedBridge:
     def __init__(self, ctx: Any, port_range: range) -> None:
         self._ctx           = ctx
         self._port_range    = port_range
-        self._port          : int | None            = None
+        self._port          : Optional[int]            = None
         self._server_socket : Any                   = None
         self._running       : bool                  = False
-        self._thread        : threading.Thread | None = None
+        self._thread        : Optional[threading.Thread] = None
         self._active_conns  : int                   = 0
         self._conn_lock                             = threading.Lock()
         self._dispatch_lock                         = threading.Lock()
 
     @property
-    def port(self) -> int | None:
+    def port(self) -> Optional[int]:
         return self._port
 
     def start(self) -> None:
@@ -234,6 +231,11 @@ class _ThreadedBridge:
         for port in self._port_range:
             try:
                 self._server_socket = winsock.Socket()
+                # SO_REUSEADDR so we can rebind a port the parent
+                # process (or a prior worker) just released. The MCP
+                # server's port-discovery probe also uses SO_REUSEADDR
+                # for the same reason.
+                self._server_socket.setsockopt_reuse()
                 self._server_socket.bind("127.0.0.1", port)
                 self._server_socket.listen(5)
                 self._port = port
@@ -348,7 +350,7 @@ class BridgeServer:
             self._impl = _ThreadedBridge(ctx, port_range)
 
     @property
-    def port(self) -> int | None:
+    def port(self) -> Optional[int]:
         return self._impl.port
 
     def start(self) -> None:
