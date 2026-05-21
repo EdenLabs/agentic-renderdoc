@@ -26,8 +26,6 @@ Options:
         Override the renderdoccmd executable path. Defaults to
         whichever ``renderdoccmd`` is found on PATH.
 """
-from __future__ import annotations
-
 import argparse
 import os
 import shutil
@@ -42,6 +40,7 @@ from pathlib import Path
 from . import renderdoc_locate
 from .bridge  import BridgeServer
 from .context import HeadlessHandlerContext
+from typing import List, Optional, Tuple
 
 
 _DEFAULT_PORT_MIN        = 19876
@@ -50,7 +49,7 @@ _DEFAULT_REMOTE_PORT_MIN = 39920
 _DEFAULT_REMOTE_PORT_MAX = 39929
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog        = "agentic-renderdoc-headless",
         description = "Headless RenderDoc replay worker (renderdoccmd-backed).",
@@ -182,7 +181,7 @@ def _die_with_parent() -> None:
         pass
 
 
-def _spawn_remoteserver(renderdoccmd: str, port_range: range) -> tuple[subprocess.Popen, int]:
+def _spawn_remoteserver(renderdoccmd: str, port_range: range) -> Tuple[subprocess.Popen, int]:
     """Spawn renderdoccmd remoteserver on the first free port in range.
 
     Returns (Popen, port). Raises RuntimeError if every port is busy or
@@ -201,7 +200,7 @@ def _spawn_remoteserver(renderdoccmd: str, port_range: range) -> tuple[subproces
     env["VK_LOADER_LAYERS_DISABLE"]             = "*"
     env["DISABLE_VK_LAYER_RENDERDOC_Capture_1"] = "1"
 
-    last_err: Exception | None = None
+    last_err: Optional[Exception] = None
     for port in port_range:
         # Pre-flight: check the port is locally bindable. renderdoccmd
         # would otherwise refuse silently or print to its stderr.

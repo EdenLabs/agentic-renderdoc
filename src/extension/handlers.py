@@ -2,30 +2,27 @@
 
 Handlers: eval, api_index, instance_info, get_texture, reload, shutdown.
 """
-from __future__ import annotations
-
 import traceback
-from collections.abc import Callable
-from typing          import Any
+from typing import Any, Callable, Dict, List, Optional
 
 from .api_index import search_index
 
 # Populated at registration time.
-HANDLERS: dict[str, dict[str, Any]] = {}
+HANDLERS = {}  # type: Dict[str, Dict[str, Any]]
 
 # Serializer dispatch table, keyed by RenderDoc type name.
 # Built lazily on first use since the serialize module imports renderdoc,
 # which may not be available during testing.
-_SERIALIZER_MAP: dict[str, Callable[..., Any]] | None = None
+_SERIALIZER_MAP = None  # type: Optional[Dict[str, Callable[..., Any]]]
 
 
 def handler(
     name: str,
     description: str = "",
-    schema: dict[str, Any] | None = None,
-) -> Callable[[Callable[..., dict[str, Any]]], Callable[..., dict[str, Any]]]:
+    schema: Optional[Dict[str, Any]] = None,
+) -> Callable[[Callable[..., Dict[str, Any]]], Callable[..., Dict[str, Any]]]:
     """Decorator to register a command handler."""
-    def decorator(func: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]:
+    def decorator(func: Callable[..., Dict[str, Any]]) -> Callable[..., Dict[str, Any]]:
         HANDLERS[name] = {
             "func"        : func,
             "description" : description,
@@ -45,7 +42,7 @@ def handler(
         "required":   ["code"],
     },
 )
-def handle_eval(ctx: Any, params: dict[str, Any]) -> dict[str, Any]:
+def handle_eval(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     """Execute arbitrary Python and return the result of the last expression.
 
     Builds a namespace with RenderDoc globals and utility modules, runs the
@@ -95,7 +92,7 @@ def handle_eval(ctx: Any, params: dict[str, Any]) -> dict[str, Any]:
         "required": ["query"],
     },
 )
-def handle_api_index(ctx: Any, params: dict[str, Any]) -> dict[str, Any]:
+def handle_api_index(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     """Search the cached API index for matching entries.
 
     Returns up to `limit` results from the pre-built API reference index.
@@ -129,7 +126,7 @@ def handle_api_index(ctx: Any, params: dict[str, Any]) -> dict[str, Any]:
     description="Return metadata about this RenderDoc instance.",
     schema={},
 )
-def handle_instance_info(ctx: Any, params: dict[str, Any]) -> dict[str, Any]:
+def handle_instance_info(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     """Return port, capture state, API type, path, and event count."""
     # Resolve the API type name from the SWIG enum. The enum wrapper may
     # or may not expose .name depending on the RenderDoc build.
@@ -172,7 +169,7 @@ def handle_instance_info(ctx: Any, params: dict[str, Any]) -> dict[str, Any]:
         "required": ["resource_id"],
     },
 )
-def handle_get_texture(ctx: Any, params: dict[str, Any]) -> dict[str, Any]:
+def handle_get_texture(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     """Read raw texture bytes and return them base64-encoded with format metadata.
 
     Uses GetTextureData for a direct memory read rather than SaveTexture,
@@ -194,7 +191,7 @@ def handle_get_texture(ctx: Any, params: dict[str, Any]) -> dict[str, Any]:
     slice_param = params.get("slice", 0)
     sample      = params.get("sample", 0)
 
-    def callback(controller: Any) -> dict[str, Any]:
+    def callback(controller: Any) -> Dict[str, Any]:
         # Find the matching texture by comparing serialized resource IDs.
         tex = None
         for t in controller.GetTextures():
@@ -247,7 +244,7 @@ def handle_get_texture(ctx: Any, params: dict[str, Any]) -> dict[str, Any]:
     description="Hot-reload extension modules without restarting RenderDoc.",
     schema={},
 )
-def handle_reload(ctx: Any, params: dict[str, Any]) -> dict[str, Any]:
+def handle_reload(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     """Reload business-logic modules in dependency order.
 
     Leaves winsock and bridge untouched (infrastructure). Mutates the
@@ -298,7 +295,7 @@ def handle_reload(ctx: Any, params: dict[str, Any]) -> dict[str, Any]:
     description="Request the bridge server to stop accepting connections and exit.",
     schema={},
 )
-def handle_shutdown(ctx: Any, params: dict[str, Any]) -> dict[str, Any]:
+def handle_shutdown(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     """Trigger a graceful bridge shutdown.
 
     For headless workers, this also tears down the replay thread and
@@ -336,7 +333,7 @@ def handle_shutdown(ctx: Any, params: dict[str, Any]) -> dict[str, Any]:
 
 # --- Internal helpers ---
 
-def _build_namespace(ctx: Any, captured_output: list[str]) -> dict[str, Any]:
+def _build_namespace(ctx: Any, captured_output: List[str]) -> Dict[str, Any]:
     """Build the execution namespace for eval, including utilities.
 
     Injects RenderDoc modules (rd, qrd), the handler context, the serialize
@@ -389,7 +386,7 @@ def _build_namespace(ctx: Any, captured_output: list[str]) -> dict[str, Any]:
     return ns
 
 
-def _exec_with_result(code: str, namespace: dict[str, Any]) -> Any:
+def _exec_with_result(code: str, namespace: Dict[str, Any]) -> Any:
     """Execute code and return the value of the last expression, if any.
 
     Splits the code into statements and the final expression. Executes all
@@ -416,7 +413,7 @@ def _exec_with_result(code: str, namespace: dict[str, Any]) -> Any:
         return None
 
 
-def _format_error(exc: Exception, code: str, namespace: dict[str, Any]) -> dict[str, Any]:
+def _format_error(exc: Exception, code: str, namespace: Dict[str, Any]) -> Dict[str, Any]:
     """Format an exception with stack trace, failing line, and contextual hints.
 
     Returns a dict with:
@@ -482,7 +479,7 @@ def _format_error(exc: Exception, code: str, namespace: dict[str, Any]) -> dict[
     }
 
 
-def _extract_failing_line(exc: Exception, code: str = "") -> str | None:
+def _extract_failing_line(exc: Exception, code: str = "") -> Optional[str]:
     """Extract the source line that caused the exception.
 
     Prefers frames from the user's eval code (filename ``<eval>``). Falls
@@ -522,7 +519,7 @@ def _extract_failing_line(exc: Exception, code: str = "") -> str | None:
     return best
 
 
-def _get_serializer_map() -> dict[str, Callable[..., Any]]:
+def _get_serializer_map() -> Dict[str, Callable[..., Any]]:
     """Lazily build the type-name-to-serializer dispatch table.
 
     Deferred because the serialize module imports renderdoc at the top
