@@ -824,10 +824,24 @@ class RenderDocClient:
     # --- Internal: worker spawn helpers ---
 
     def _first_free_port(self, port_range: range, exclude: set[int] | None = None) -> int | None:
-        """Return the first locally-bindable port in range, skipping exclude."""
+        """Return the first locally-bindable port in range, skipping exclude.
+
+        A bind probe with ``SO_REUSEADDR`` is not enough on Windows: the
+        extension's bridge listener also sets ``SO_REUSEADDR`` (see
+        ``bridge.py:_ThreadedBridge.start``), so two listeners can coexist
+        on the same port. ``bind()`` would silently succeed against a port
+        that already has a running bridge, and the worker we then spawn
+        would race the existing bridge for incoming connections.
+        Connect-probe first to detect a live bridge.
+        """
         excl = exclude or set()
         for port in port_range:
             if port in excl:
+                continue
+            if self._probe_port(port) is not None:
+                # Something is already listening — could be a GUI bridge
+                # on the same port that we'd otherwise hijack via
+                # SO_REUSEADDR.
                 continue
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
