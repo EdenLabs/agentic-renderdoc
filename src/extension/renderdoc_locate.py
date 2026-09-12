@@ -59,6 +59,18 @@ class RenderDocLocateError(RuntimeError):
     """Raised when the RenderDoc Python module cannot be located or loaded."""
 
 
+def module_available() -> bool:
+    """True if a standalone RenderDoc Python module exists on this system.
+
+    Filesystem check only: nothing is loaded or imported, so this is
+    safe to call from the MCP server process. Distro packages often
+    ship ``librenderdoc.so`` and the binaries but not the SWIG module
+    (Arch's ``renderdoc`` package is one), in which case the bindings
+    are only reachable from qrenderdoc's embedded Python.
+    """
+    return any(True for _ in _iter_candidates())
+
+
 def setup() -> dict:
     """Locate, preload, and import the RenderDoc Python module.
 

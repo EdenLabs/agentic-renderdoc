@@ -89,6 +89,23 @@ python scripts/install.py
 
 This builds a wheel and pip-installs the MCP server. It does not install the extension (step 1).
 
+On distros where pip refuses system-wide installs (Arch and Debian mark
+Python as externally managed), install into a venv instead and point the
+MCP config at the venv's `agentic-renderdoc` binary:
+
+```bash
+python -m venv .venv
+.venv/bin/pip install .
+```
+
+**Headless replay without the standalone Python module.** The headless
+worker normally imports the `renderdoc` SWIG module into system Python.
+Windows never ships it, and some Linux packages (Arch's `renderdoc`)
+install only `librenderdoc.so` and the binaries. When the module cannot
+be found the server runs the worker inside `qrenderdoc --script` instead,
+which has the bindings built in. No configuration needed; `qrenderdoc`
+just has to be on `PATH`.
+
 ### 3. Configure Your MCP Client
 
 Add this to your MCP client config:

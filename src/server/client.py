@@ -5,6 +5,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -116,6 +117,20 @@ def _find_qrenderdoc() -> str | None:
             if c and os.path.isfile(c):
                 return c
     return None
+
+
+def _standalone_module_available() -> bool:
+    """True if external Python can import ``renderdoc`` from a known location.
+
+    Delegates to the extension's locator, which only inspects the
+    filesystem. The import is deferred so the server never pulls
+    ``librenderdoc.so`` into its own process.
+    """
+    src_dir = str(Path(__file__).resolve().parent.parent)
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
+    from extension import renderdoc_locate
+    return renderdoc_locate.module_available()
 
 
 def _die_with_parent() -> None:
@@ -559,22 +574,25 @@ class RenderDocClient:
                 f"{_PORT_RANGE.start}-{_PORT_RANGE.stop - 1}"
             )
 
-        # On Windows the standard RenderDoc distribution does not ship
-        # ``renderdoc.pyd`` for external Python — the SWIG bindings are
-        # compiled into ``qrenderdoc.exe``. Run headless logic inside
-        # qrenderdoc's embedded Python via ``--script``; it exits via
-        # ``os._exit(0)`` before qrenderdoc ever opens its main UI, and
-        # uses in-process ``rd.OpenCaptureFile`` rather than
+        # The standalone ``renderdoc`` SWIG module is not always
+        # available to external Python: the Windows distribution never
+        # ships ``renderdoc.pyd``, and some Linux distro packages (Arch)
+        # ship only ``librenderdoc.so`` plus the binaries. In both cases
+        # the bindings are compiled into qrenderdoc. Run the headless
+        # logic inside qrenderdoc's embedded Python via ``--script``; it
+        # exits via ``os._exit(0)`` before qrenderdoc ever opens its main
+        # UI, and uses in-process ``rd.OpenCaptureFile`` rather than
         # ``renderdoccmd remoteserver``. No remote port needed.
-        windows_embedded = sys.platform == "win32"
+        use_embedded = sys.platform == "win32" or not _standalone_module_available()
 
-        if windows_embedded:
+        if use_embedded:
             remote_port = None
             qrd_path = _find_qrenderdoc()
             if qrd_path is None:
                 raise RuntimeError(
-                    "could not locate qrenderdoc.exe (looked on PATH and "
-                    "%ProgramFiles%\\RenderDoc); install RenderDoc system-wide"
+                    "no standalone renderdoc Python module found and could "
+                    "not locate qrenderdoc on PATH; install RenderDoc "
+                    "system-wide or set AGENTIC_RENDERDOC_HOME"
                 )
             embedded_script = (
                 Path(__file__).resolve().parent.parent / "extension" / "embedded_headless.py"
@@ -618,7 +636,7 @@ class RenderDocClient:
         env["VK_LOADER_LAYERS_DISABLE"]                = "*"
         env["DISABLE_VK_LAYER_RENDERDOC_Capture_1"]    = "1"
 
-        if windows_embedded:
+        if use_embedded:
             # qrenderdoc does not populate sys.argv inside --script, so
             # the embedded script reads its config from env vars instead.
             # PKG_PARENT is the directory the script prepends to sys.path
@@ -636,6 +654,22 @@ class RenderDocClient:
             # GuiHandlerContext-backed one instead of ours. The
             # extension's register() checks this var and no-ops.
             env["AGENTIC_DISABLE_AUTOLOAD"]    = "1"
+            # qrenderdoc still initialises Qt before running the script,
+            # and on Linux the default platform plugin needs a display.
+            # The UI never appears, so the offscreen plugin is enough and
+            # keeps the worker usable over SSH.
+            if sys.platform != "win32":
+                env.setdefault("QT_QPA_PLATFORM", "offscreen")
+            # The embedded log is append-only across runs on the same
+            # port. Drop the previous run's copy so a bind failure
+            # reports this spawn's diagnostics, not stale history.
+            try:
+                os.remove(os.path.join(
+                    tempfile.gettempdir(),
+                    f"agentic-renderdoc-embedded-{bridge_port}.log",
+                ))
+            except OSError:
+                pass
 
         popen_kwargs = {
             "stdin"  : subprocess.DEVNULL,
@@ -693,10 +727,10 @@ class RenderDocClient:
             # the per-port log file the script writes instead. The path
             # must match the one embedded_headless.py writes.
             log_text = ""
-            if windows_embedded:
-                base = os.environ.get("TEMP") or os.environ.get("TMP") or "."
+            if use_embedded:
                 log_path = os.path.join(
-                    base, f"agentic-renderdoc-embedded-{bridge_port}.log"
+                    tempfile.gettempdir(),
+                    f"agentic-renderdoc-embedded-{bridge_port}.log",
                 )
                 try:
                     with open(log_path, "r", encoding="utf-8", errors="replace") as f:
@@ -704,7 +738,7 @@ class RenderDocClient:
                 except OSError:
                     pass
 
-            if windows_embedded:
+            if use_embedded:
                 diag  = log_text or err_text or "<empty>"
                 label = "embedded-log"
             else:

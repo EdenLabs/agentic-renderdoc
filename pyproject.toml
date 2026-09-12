@@ -15,7 +15,7 @@ classifiers = [
     "Topic :: Software Development :: Debuggers",
 ]
 dependencies = [
-    "mcp[cli]>=1.26",
+    "mcp[cli]>=1.26,<2",
     "Pillow>=10.0",
 ]
 

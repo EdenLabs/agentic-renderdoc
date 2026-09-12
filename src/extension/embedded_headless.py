@@ -1,8 +1,9 @@
 """Embedded headless entry point — runs inside qrenderdoc's --script.
 
-Used on Windows where ``renderdoc.pyd`` is not shipped as a standalone
-Python module: the SWIG bindings are statically compiled into
-``qrenderdoc.exe`` and only accessible from its embedded Python. We run
+Used wherever ``renderdoc`` is not shipped as a standalone Python
+module: always on Windows, and on Linux distros whose package installs
+only ``librenderdoc.so`` and the binaries (Arch). The SWIG bindings are
+compiled into qrenderdoc and only accessible from its embedded Python. We run
 our headless protocol inside qrenderdoc's interpreter via ``--script``,
 which runs before qrenderdoc opens its main UI: as long as this script
 never returns, the UI never appears. On shutdown we call
@@ -22,7 +23,7 @@ Configuration (env vars; ``sys.argv`` is empty inside ``--script``):
                                     sys.path so we can import from it.
 
 Diagnostics are appended to
-``%TEMP%/agentic-renderdoc-embedded-<port>.log`` because qrenderdoc as
+``<tempdir>/agentic-renderdoc-embedded-<port>.log`` because qrenderdoc as
 a GUI subprocess produces no visible stdout/stderr. The port suffix
 prevents collisions between concurrent workers writing to the same file.
 
@@ -35,6 +36,7 @@ the work that was already done to make those files 3.6-compatible.
 
 import os
 import sys
+import tempfile
 import time
 import traceback
 
@@ -44,7 +46,7 @@ _DEFAULT_PORT_MAX = 19885
 
 
 def _log_path(port):
-    base = os.environ.get("TEMP") or os.environ.get("TMP") or "."
+    base = tempfile.gettempdir()
     return os.path.join(base, "agentic-renderdoc-embedded-{}.log".format(port))
 
 
