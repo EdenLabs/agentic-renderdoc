@@ -32,10 +32,8 @@ def register(version: str, ctx: Any) -> None:
     point (see ``embedded_headless.py``), which runs as
     ``qrenderdoc --script`` and provides its own ``EmbeddedHeadlessContext``
     plus bridge. Without this skip, qrenderdoc's ``AlwaysLoad_Extensions``
-    auto-load would race the embedded script and bind a second bridge
-    on the same port (Windows' SO_REUSEADDR allows hijacking-style
-    coexistence), with incoming connections being routed to the
-    GUI-context bridge instead of the embedded one.
+    auto-load would start a GUI-context bridge inside the worker process
+    that races the embedded script for the worker's pinned port.
     """
     global _extension, _server
 

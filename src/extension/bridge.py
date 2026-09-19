@@ -231,11 +231,7 @@ class _ThreadedBridge:
         for port in self._port_range:
             try:
                 self._server_socket = winsock.Socket()
-                # SO_REUSEADDR so we can rebind a port the parent
-                # process (or a prior worker) just released. The MCP
-                # server's port-discovery probe also uses SO_REUSEADDR
-                # for the same reason.
-                self._server_socket.setsockopt_reuse()
+                self._server_socket.set_listener_bind_policy()
                 self._server_socket.bind("127.0.0.1", port)
                 self._server_socket.listen(5)
                 self._port = port

@@ -41,8 +41,12 @@ if sys.platform != "win32":
             else:
                 self._sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
 
-        def setsockopt_reuse(self):
-            """Enable SO_REUSEADDR so the port can be rebound immediately."""
+        def set_listener_bind_policy(self):
+            """Rebind a just-released port at once, never share a live one.
+
+            POSIX SO_REUSEADDR does exactly that: it skips TIME_WAIT and
+            still refuses a port another socket is listening on.
+            """
             self._sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
 
         def bind(self, host: str, port: int):
@@ -94,7 +98,7 @@ else:
     SOCK_STREAM     = 1
     IPPROTO_TCP     = 6
     SOL_SOCKET      = 0xFFFF
-    SO_REUSEADDR    = 4
+    SO_EXCLUSIVEADDRUSE = ~4
     INVALID_SOCKET  = ~0 & 0xFFFFFFFFFFFFFFFF
     SOCKET_ERROR    = -1
     INADDR_LOOPBACK = 0x7F000001  # 127.0.0.1; needs htonl before use.
@@ -234,11 +238,18 @@ else:
                 if self._handle == INVALID_SOCKET:
                     raise SocketError("socket")
 
-        def setsockopt_reuse(self):
-            """Enable SO_REUSEADDR so the port can be rebound immediately."""
+        def set_listener_bind_policy(self):
+            """Rebind a just-released port at once, never share a live one.
+
+            Winsock's SO_REUSEADDR lets a second socket bind a port that
+            is being listened on, and connections then reach either
+            listener. SO_EXCLUSIVEADDRUSE refuses that in both
+            directions: this bind fails on a port that is held, and no
+            later socket can bind onto this one whatever options it sets.
+            """
             val    = ctypes.c_int(1)
             result = ws2_32.setsockopt(
-                self._handle, SOL_SOCKET, SO_REUSEADDR,
+                self._handle, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
                 ctypes.cast(ctypes.byref(val), ctypes.c_char_p),
                 ctypes.sizeof(val),
             )

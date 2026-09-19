@@ -133,14 +133,17 @@ The new code paths are intentionally small:
     `extension` package without depending on `__file__`.
   - `AGENTIC_DISABLE_AUTOLOAD`     — set to `1` so qrenderdoc's
     `AlwaysLoad_Extensions` doesn't trigger the GUI-context bridge to
-    bind a competing socket on the same port. Without this, on
-    Windows with `SO_REUSEADDR`, two bridges coexist as listeners and
-    incoming connections routinely hit the GUI bridge instead of ours.
-    The extension's `register()` checks this env var and no-ops.
+    start inside the worker process. It races the embedded script for the worker's
+    pinned port: the auto-loaded bridge walks the port range, but the
+    embedded script is pinned to one port and exits if it loses. The extension's `register()`
+    checks this env var and no-ops.
 
-Diagnostics from the embedded script land in
-`%TEMP%/agentic-renderdoc-embedded-<port>.log` (port-suffixed to
-prevent concurrent workers racing on a shared file).
+Diagnostics from the embedded script land in one file per spawn,
+`<temp>/agentic-renderdoc/<port>-<server pid>-<spawn time>.log`. The server names the
+file and passes it as `AGENTIC_EMBEDDED_LOG`, so a failed spawn's error
+carries that run's lines and no other's; the server deletes files older
+than a week each time it starts, because nothing else cleans the OS temp
+directory reliably.
 
 ## Summary of changes specifically for Windows support
 
@@ -148,7 +151,7 @@ prevent concurrent workers racing on a shared file).
 |---|---|
 | `src/extension/__init__.py` | Replaced `from __future__ import annotations` + PEP-604 syntax with `typing.Optional`. |
 | `src/extension/api_index.py` | Same — typing.* in place of PEP-585 subscripted generics. |
-| `src/extension/bridge.py` | Same, plus `SO_REUSEADDR` on the threaded listener (see note below). |
+| `src/extension/bridge.py` | Same, plus the threaded listener's bind policy (see note below). |
 | `src/extension/context.py` | Same, plus lazy `import concurrent.futures` / `queue` inside `HeadlessHandlerContext.__init__` so importing the module doesn't pull `concurrent.futures` (which transitively requires `socket`). Plus a new `EmbeddedHeadlessContext` class for in-process replay inside qrenderdoc. |
 | `src/extension/handlers.py` | Same. `collections.abc.Callable` → `typing.Callable` (subscripted `Callable[[...], ...]` annotations require `typing.Callable` on 3.6). |
 | `src/extension/serialize.py` | Syntax-only. |
@@ -157,27 +160,28 @@ prevent concurrent workers racing on a shared file).
 | `src/extension/renderdoc_locate.py` | Syntax-only. |
 | `src/extension/winsock.py` | Single type-comment fix for a 3.6-incompatible annotation in the Windows branch. |
 | `src/extension/embedded_headless.py` | **New.** Thin Windows headless entry point (~130 lines). Imports `EmbeddedHeadlessContext`, `BridgeServer`, and the upstream `HANDLERS` from the package — no logic duplicated. |
-| `src/server/client.py` | Windows branch in `spawn_headless_worker` to launch `qrenderdoc --script embedded_headless.py`. `_find_qrenderdoc()` helper. Bind-failure error message reads `%TEMP%/agentic-renderdoc-embedded-<port>.log` when the embedded path failed (qrenderdoc as GUI doesn't surface stderr). Skips the `renderdoccmd remote-server` port allocation on Windows since the embedded path doesn't use one. |
+| `src/server/client.py` | Windows branch in `spawn_headless_worker` to launch `qrenderdoc --script embedded_headless.py`. `_find_qrenderdoc()` helper. Bind-failure error message reads the spawn's own log file when the embedded path failed (qrenderdoc as GUI doesn't surface stderr). Skips the `renderdoccmd remote-server` port allocation on Windows since the embedded path doesn't use one. |
 
 Linux Python 3.10+ is unaffected — all replaced syntax is valid in
 every Python ≥3.5, and the Windows-specific branches in `client.py`
 are guarded by `sys.platform == "win32"`.
 
-## Side note: `SO_REUSEADDR` on the threaded bridge
+## Side note: the bridge port is never shared
 
-`_ThreadedBridge.start()` in `src/extension/bridge.py` now calls
-`setsockopt_reuse()` on the listener socket before `bind()`. This is a
-cross-platform improvement, not Windows-specific:
+`_ThreadedBridge.start()` in `src/extension/bridge.py` calls
+`set_listener_bind_policy()` on the listener before `bind()`, and the
+MCP server's port-discovery probe
+(`src/server/client.py:_first_free_port`) applies the same policy, so
+the probe refuses exactly the ports the worker's bind would refuse:
 
-- On any platform, the MCP server's port-discovery probe in
-  `src/server/client.py:_first_free_port` binds a port with
-  `SO_REUSEADDR` and closes it immediately before spawning the worker.
-  Without `SO_REUSEADDR` on the worker's listener, the worker can fail
-  to rebind the same port during the brief window the OS holds it.
-- On Linux/macOS, `SO_REUSEADDR` just allows rebinding through TIME_WAIT
-  — standard, safe behaviour.
-- On Windows specifically, `SO_REUSEADDR` has hijacking semantics
-  (multiple listeners can coexist on the same port), which is what
-  makes the `AGENTIC_DISABLE_AUTOLOAD` env var (above) necessary —
-  without it, both the auto-loaded GUI bridge and the embedded bridge
-  would bind the same port and connections would race.
+- On Linux/macOS the policy is `SO_REUSEADDR`: rebinding through
+  TIME_WAIT, and still a refusal on a port that is being listened on.
+- On Windows `SO_REUSEADDR` means something else — a second socket
+  binds onto a port that is being listened on, and connections reach
+  either listener, provided the holder set `SO_REUSEADDR` too. A GUI
+  qrenderdoc's bridge is this same threaded listener, so with
+  `SO_REUSEADDR` on both the listener and the probe, a GUI-held port
+  read as free and the worker was sent onto it. The policy there is
+  `SO_EXCLUSIVEADDRUSE`, which refuses a held port and cannot be bound
+  onto afterwards. A port released by a closed worker rebinds at once
+  under it.

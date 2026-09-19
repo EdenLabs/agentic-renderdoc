@@ -2,9 +2,11 @@
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -19,6 +21,56 @@ _CONNECT_TIMEOUT    = 2.0
 _WRITE_TIMEOUT      = 5.0
 _WORKER_BIND_WAIT   = 30.0
 _WORKER_GRACE_SECS  = 5.0
+_WORKER_LOG_MAX_AGE = 7 * 24 * 3600.0
+_WORKER_LOG_NAME    = re.compile(r"\d+-\d+-\d+\.log")
+
+
+def worker_log_dir() -> Path:
+    """Directory holding one diagnostic log per embedded worker spawn."""
+    return Path(tempfile.gettempdir()) / "agentic-renderdoc"
+
+
+def new_worker_log_path(bridge_port: int) -> Path:
+    """Name a log file for one spawn, creating its directory.
+
+    The server's pid keeps two servers spawning on one port apart
+    whatever the clock's resolution. Falls back to the temp directory
+    itself when the owned directory cannot be made, so the path the
+    error message reports is always one the worker could write.
+    """
+    name = f"{bridge_port}-{os.getpid()}-{time.time_ns()}.log"
+    directory = worker_log_dir()
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        directory = Path(tempfile.gettempdir())
+    return directory / name
+
+
+def sweep_worker_logs() -> None:
+    """Delete worker logs older than the retention age. Best-effort.
+
+    Run once at server start: nothing else removes these files, and
+    the OS temp directory is not reliably cleaned on any platform.
+    Only files named as new_worker_log_path names them are touched,
+    and never through a symlinked directory: the temp directory can be
+    shared between users, and this deletes.
+    """
+    cutoff = time.time() - _WORKER_LOG_MAX_AGE
+    try:
+        directory = worker_log_dir()
+        if directory.is_symlink():
+            return
+        candidates = [p for p in directory.glob("*.log") if _WORKER_LOG_NAME.fullmatch(p.name)]
+    except OSError:
+        return
+    for path in candidates:
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            continue
+
 
 # Per-command read deadlines. Anything not in this map gets the default.
 # eval and get_texture can drive SetFrameEvent which triggers a full
@@ -630,12 +682,15 @@ class RenderDocClient:
             env["AGENTIC_EMBEDDED_PORT_MAX"]   = str(bridge_port)
             env["AGENTIC_EMBEDDED_PKG_PARENT"] = str(src_dir)
             # Prevent qrenderdoc's AlwaysLoad_Extensions auto-load from
-            # binding a competing bridge on the same port. With Windows'
-            # SO_REUSEADDR semantics both bridges would coexist as
-            # listeners and incoming connections would routinely hit the
-            # GuiHandlerContext-backed one instead of ours. The
-            # extension's register() checks this var and no-ops.
+            # starting a GuiHandlerContext-backed bridge inside the
+            # worker process, racing the embedded script for the pinned
+            # port. The extension's register() checks
+            # this var and no-ops.
             env["AGENTIC_DISABLE_AUTOLOAD"]    = "1"
+            # One log file per spawn, so a failed spawn reports its own
+            # lines and nothing from earlier runs on the same port.
+            worker_log = new_worker_log_path(bridge_port)
+            env["AGENTIC_EMBEDDED_LOG"]        = str(worker_log)
 
         popen_kwargs = {
             "stdin"  : subprocess.DEVNULL,
@@ -690,23 +745,17 @@ class RenderDocClient:
 
             # Embedded-headless mode (qrenderdoc --script) doesn't write
             # diagnostics to stderr — qrenderdoc is a GUI subprocess. Read
-            # the per-port log file the script writes instead. The path
-            # must match the one embedded_headless.py writes.
+            # the log file this spawn was given instead.
             log_text = ""
             if windows_embedded:
-                base = os.environ.get("TEMP") or os.environ.get("TMP") or "."
-                log_path = os.path.join(
-                    base, f"agentic-renderdoc-embedded-{bridge_port}.log"
-                )
                 try:
-                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                        log_text = f.read().strip()
+                    log_text = worker_log.read_text(encoding="utf-8", errors="replace").strip()
                 except OSError:
                     pass
 
             if windows_embedded:
                 diag  = log_text or err_text or "<empty>"
-                label = "embedded-log"
+                label = f"embedded-log ({worker_log})"
             else:
                 diag  = err_text or "<empty>"
                 label = "stderr"
@@ -830,7 +879,14 @@ class RenderDocClient:
             if port in excl:
                 continue
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # The probe must refuse exactly what the worker's listener
+            # will refuse. Winsock's SO_REUSEADDR binds onto a port that
+            # is being listened on, so a held port would read as free;
+            # POSIX SO_REUSEADDR only skips TIME_WAIT.
+            if sys.platform == "win32":
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 s.bind(("127.0.0.1", port))
             except OSError:

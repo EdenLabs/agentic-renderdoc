@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from server.app import mcp
+from server.client import sweep_worker_logs
 
 
 def main() -> None:
+    sweep_worker_logs()
     mcp.run()
 
 

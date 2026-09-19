@@ -20,11 +20,12 @@ Configuration (env vars; ``sys.argv`` is empty inside ``--script``):
     AGENTIC_EMBEDDED_PKG_PARENT  -- directory containing the
                                     ``extension`` package; prepended to
                                     sys.path so we can import from it.
+    AGENTIC_EMBEDDED_LOG         -- file this run's diagnostics go to.
 
-Diagnostics are appended to
-``%TEMP%/agentic-renderdoc-embedded-<port>.log`` because qrenderdoc as
-a GUI subprocess produces no visible stdout/stderr. The port suffix
-prevents collisions between concurrent workers writing to the same file.
+Diagnostics go to a file because qrenderdoc as a GUI subprocess
+produces no visible stdout/stderr. The spawning side names one file
+per spawn, so a file holds exactly one run; it owns the directory and
+its cleanup.
 
 This file is intentionally short. The actual replay context, bridge
 server, and handlers live in the ``extension`` package — sharing all
@@ -43,15 +44,12 @@ _DEFAULT_PORT_MIN = 19876
 _DEFAULT_PORT_MAX = 19885
 
 
-def _log_path(port):
-    base = os.environ.get("TEMP") or os.environ.get("TMP") or "."
-    return os.path.join(base, "agentic-renderdoc-embedded-{}.log".format(port))
-
-
-def _log(port, msg):
-    """Append to the per-port diagnostic log. Best-effort."""
+def _log(path, msg):
+    """Append to this run's diagnostic log. Best-effort; no path, no log."""
+    if not path:
+        return
     try:
-        with open(_log_path(port), "a", encoding="utf-8") as f:
+        with open(path, "a", encoding="utf-8") as f:
             f.write("[{:.3f}] {}\n".format(time.time(), msg))
     except Exception:
         pass
@@ -65,9 +63,8 @@ def main():
     except ValueError:
         port_min, port_max = _DEFAULT_PORT_MIN, _DEFAULT_PORT_MAX
 
-    # Diagnostic log path is port-suffixed; log to the configured range's
-    # start until we have an actual bound port.
-    log = lambda msg: _log(port_min, msg)
+    log_path = os.environ.get("AGENTIC_EMBEDDED_LOG", "")
+    log = lambda msg: _log(log_path, msg)
     log("=== embedded_headless start ===")
     log("python: " + sys.version)
 
@@ -125,8 +122,6 @@ def main():
             log("bridge failed to bind in range {}-{}".format(port_min, port_max))
             os._exit(6)
 
-        # Re-target the log to the actual bound port.
-        log = lambda msg, _p=bridge.port: _log(_p, msg)
         log("bridge bound on localhost:{}".format(bridge.port))
 
         ctx._server_port = bridge.port
