@@ -38,7 +38,8 @@ Two processes connected by TCP over loopback. The MCP server is spawned by the c
 | Tool | Purpose |
 |---|---|
 | **Eval** | Execute Python in the RenderDoc replay session. Primary interface for all inspection, analysis, and debugging. |
-| **Search API** | Search the RenderDoc Python API reference. Built by introspecting the live `renderdoc` module, so it always matches the running version. |
+| **Search-API** | Search the RenderDoc Python API reference. Built by introspecting the live `renderdoc` module, so it always matches the running version. |
+| **Get-Texture** | Capture a texture or render target as a viewable PNG image alongside its metadata. Supports mip/slice/sample selection, subregion crops, single-channel extraction, and HDR-to-LDR mapping via a black/white point range. |
 | **Instance** | List, connect to, or disconnect from running RenderDoc instances. Auto-connects on first use. |
 
 ## Pre-loaded Utilities
@@ -120,8 +121,10 @@ Configuration file locations:
 Two halves:
 
 - **`src/extension/`** - Runs inside RenderDoc's embedded Python. Hosts the TCP server, handles commands, serializes RenderDoc types.
-- **`src/server/`** - The MCP server, spawned by the client. Defines the three tools and connects to the extension over TCP.
+- **`src/server/`** - The MCP server, spawned by the client. Defines the four tools and connects to the extension over TCP.
 - **`scripts/`** - Install, test, and packaging utilities.
+- **`package.py`** - Build script. Produces the deployable extension and the MCP server wheel in `dist/`.
+- **`docs/`** - Design and implementation notes.
 
 ### Testing
 
@@ -156,7 +159,7 @@ ln -s <repo>/src/extension ~/.local/share/qrenderdoc/extensions/agentic_renderdo
 
 V1 exposed 70 tools. In practice the agent ignored most of them, went straight to the Python eval handler, and spent ~6 iterations fumbling the RenderDoc API before becoming productive. Every session. The agent also frequently made mistakes and struggled with interpreting the raw data renderdoc spat out.
 
-V2 reduces to three tools with rich descriptions. The tool description *is* the prompt engineering. It encodes the access model, object graph, cursor semantics, and working patterns so the agent writes correct RenderDoc Python on the first call.
+V2 reduces to four tools with rich descriptions. The tool description *is* the prompt engineering. It encodes the access model, object graph, cursor semantics, and working patterns so the agent writes correct RenderDoc Python on the first call.
 
 This approach is backed by [Zhang et al., "One Tool Is Enough"](https://arxiv.org/abs/2512.20957): fewer, semantically grounded tools outperform large tool suites, even across model size gaps. We observed the same behavior while building this tool.
 
