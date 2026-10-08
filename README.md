@@ -40,7 +40,7 @@ Two processes connected by TCP over loopback. The MCP server is spawned by the c
 | **Eval** | Execute Python in the RenderDoc replay session. Primary interface for all inspection, analysis, and debugging. |
 | **Search-API** | Search the RenderDoc Python API reference. Built by introspecting the live `renderdoc` module, so it always matches the running version. |
 | **Get-Texture** | Capture a texture or render target as a viewable PNG image alongside its metadata. Supports mip/slice/sample selection, subregion crops, single-channel extraction, and HDR-to-LDR mapping via a black/white point range. |
-| **Instance** | List, connect to, or disconnect from running RenderDoc instances. Auto-connects on first use. |
+| **Instance** | Manage RenderDoc replay instances, both live GUIs and headless workers. List, connect to, or disconnect from running instances, discover `.rdc` captures on disk, and open a capture in a headless `renderdoccmd remoteserver` worker (or close one). Auto-connects on first use. |
 
 ## Pre-loaded Utilities
 
